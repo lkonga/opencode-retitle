@@ -196,7 +196,12 @@ function titleTextFromMessages(messages: readonly MessageWithParts[]): string {
 function pickSessionModel(
   messages: ReadonlyArray<MessageWithParts>,
   providers: ReadonlyArray<Provider>,
+  smallModel?: string,
 ): { providerID: string; modelID: string } | undefined {
+  if (smallModel) {
+    const parsed = parseModelString(smallModel)
+    if (parsed) return parsed
+  }
   for (const msg of messages) {
     if (msg.info?.model?.providerID && msg.info?.model?.modelID) {
       return msg.info.model as { providerID: string; modelID: string }
@@ -208,6 +213,12 @@ function pickSessionModel(
     }
   }
   return undefined
+}
+
+function parseModelString(input: string): { providerID: string; modelID: string } | undefined {
+  const slash = input.indexOf("/")
+  if (slash <= 0 || slash >= input.length - 1) return undefined
+  return { providerID: input.slice(0, slash), modelID: input.slice(slash + 1) }
 }
 
 async function waitForGeneratedTitle(api: TuiPluginApi, childID: string): Promise<string | undefined> {
@@ -256,7 +267,7 @@ async function generateRetitle(api: TuiPluginApi, sessionID: string, rawArgs?: s
     return undefined
   }
 
-  const model = pickSessionModel(messages, api.state.provider)
+  const model = pickSessionModel(messages, api.state.provider, api.state.config.small_model)
   if (!model) throw new Error("Connect a provider before using /retitle")
   retitleLog("model-selected", { sessionID, providerID: model.providerID, modelID: model.modelID })
 
