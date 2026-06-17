@@ -302,23 +302,82 @@ async function retitleSession(api: TuiPluginApi, sessionID: string, rawArgs?: st
 }
 
 function askArgs(api: TuiPluginApi, sessionID: string) {
+  const options = [
+    {
+      title: "Retitle with defaults",
+      value: "default",
+      description: "Tail-3 sampling, 10 max samples, no hint",
+    },
+    {
+      title: "Retitle — last 20 messages",
+      value: "offset20",
+      description: "--offset 20",
+    },
+    {
+      title: "Retitle — last 50 messages",
+      value: "offset50",
+      description: "--offset 50",
+    },
+    {
+      title: "Retitle — broad sample (20 turns)",
+      value: "broad",
+      description: "--samples 20 --from 50",
+    },
+    {
+      title: "Retitle — with hint…",
+      value: "hint",
+      description: "Enter a custom steering hint",
+    },
+  ]
+
   api.ui.dialog.replace(() =>
-    api.ui.DialogPrompt({
+    api.ui.DialogSelect({
       title: "Retitle Session",
-      placeholder: "optional hint or --samples 20 --from 50 --offset 30",
-      onConfirm: (value: string) => {
-        api.ui.dialog.clear()
-        retitleSession(api, sessionID, value).catch((error) => {
-          retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
-          api.ui.toast({
-            variant: "error",
-            title: "Retitle failed",
-            message: error instanceof Error ? error.message : String(error),
-            duration: 7000,
+      options,
+      current: "default",
+      onSelect: (opt: { title: string; value: string }) => {
+        if (opt.value === "hint") {
+          api.ui.dialog.replace(() =>
+            api.ui.DialogPrompt({
+              title: "Retitle — Steering Hint",
+              placeholder: "e.g. focus on the Docker deployment work",
+              onConfirm: (value: string) => {
+                api.ui.dialog.clear()
+                retitleSession(api, sessionID, value).catch((error) => {
+                  retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
+                  api.ui.toast({
+                    variant: "error",
+                    title: "Retitle failed",
+                    message: error instanceof Error ? error.message : String(error),
+                    duration: 7000,
+                  })
+                })
+              },
+              onCancel: () => {
+                api.ui.dialog.clear()
+                askArgs(api, sessionID)
+              },
+            }),
+          )
+        } else {
+          api.ui.dialog.clear()
+          const argMap: Record<string, string> = {
+            default: "",
+            offset20: "--offset 20",
+            offset50: "--offset 50",
+            broad: "--samples 20 --from 50",
+          }
+          retitleSession(api, sessionID, argMap[opt.value] || "").catch((error) => {
+            retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
+            api.ui.toast({
+              variant: "error",
+              title: "Retitle failed",
+              message: error instanceof Error ? error.message : String(error),
+              duration: 7000,
+            })
           })
-        })
+        }
       },
-      onCancel: () => api.ui.dialog.clear(),
     }),
   )
 }
