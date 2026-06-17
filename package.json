@@ -1,0 +1,14 @@
+{
+  "name": "opencode-retitle",
+  "version": "1.0.0",
+  "description": "/retitle TUI plugin for OpenCode — generate session titles from conversation turns",
+  "type": "module",
+  "exports": {
+    "./tui": "./tui.ts"
+  },
+  "keywords": ["opencode", "plugin", "tui", "retitle", "session", "title"],
+  "opencode": {
+    "plugin": true
+  },
+  "license": "MIT"
+}
