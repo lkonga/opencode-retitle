@@ -18,6 +18,13 @@ type SamplingOptions = {
   offset?: number
 }
 
+type RetitleSettings = {
+  samples: number
+  offset: number
+  fromPct: number
+  steering: string
+}
+
 const MAX_SAMPLE_TEXT_LENGTH = 200
 
 function retitleLog(event: string, data: Record<string, unknown> = {}) {
@@ -35,7 +42,8 @@ function truncateText(text: string): string {
   return text.slice(0, MAX_SAMPLE_TEXT_LENGTH) + "..."
 }
 
-function textFromParts(parts: Array<Part>): string | undefined {
+function textFromParts(parts: Array<Part> | undefined | null): string | undefined {
+  if (!parts || !Array.isArray(parts)) return undefined
   const text = parts
     .filter((part) => part?.type === "text" && !(part as any).ignored)
     .map((part) => String((part as TextPart).text ?? "").trim())
@@ -80,21 +88,31 @@ function parseRetitleArgs(raw?: string): { steeringHint?: string; samplingOption
   return { steeringHint, samplingOptions }
 }
 
+function settingsToArgs(s: RetitleSettings): string {
+  const parts: string[] = []
+  if (s.samples !== 10) parts.push(`--samples ${s.samples}`)
+  if (s.offset > 0) parts.push(`--offset ${s.offset}`)
+  if (s.fromPct !== 100) parts.push(`--from ${s.fromPct}`)
+  if (s.steering.trim()) parts.push(s.steering.trim())
+  return parts.join(" ")
+}
+
 function sampleTurns(messages: ReadonlyArray<MessageWithParts>, options?: SamplingOptions): SampledMessage[] {
-  const baseMessages = options?.offset !== undefined ? messages.slice(-options.offset) : messages
+  const offset = options?.offset
+  const baseMessages = offset !== undefined ? messages.slice(-Math.min(offset, messages.length)) : messages
   const userTurns = (baseMessages as Array<MessageWithParts>)
     .map((message, index) => ({ message, index }))
     .filter(({ message }) => message.info?.role === "user" && textFromParts(message.parts))
 
   if (userTurns.length === 0) return []
 
-  const MAX_SAMPLES = options?.maxSamples ?? 10
-  const TAIL = 3
+  const MAX_SAMPLES = Math.min(options?.maxSamples ?? 10, userTurns.length)
+  const TAIL = Math.min(3, MAX_SAMPLES)
 
   let windowStart: number
   let windowLen: number
 
-  if (options?.offset !== undefined) {
+  if (offset !== undefined) {
     windowStart = 0
     windowLen = userTurns.length
   } else {
@@ -116,11 +134,15 @@ function sampleTurns(messages: ReadonlyArray<MessageWithParts>, options?: Sampli
     for (let i = Math.max(0, userTurns.length - TAIL); i < userTurns.length; i++) sampleIndices.add(i)
 
     const spreadCount = MAX_SAMPLES - TAIL
-    const spreadEnd = userTurns.length - TAIL
-    const spreadLen = spreadEnd - windowStart
-    for (let i = 0; i < spreadCount; i++) {
-      const idx = windowStart + Math.round((i * (spreadLen - 1)) / (spreadCount - 1))
-      sampleIndices.add(idx)
+    if (spreadCount > 0) {
+      const spreadEnd = userTurns.length - TAIL
+      const spreadLen = Math.max(1, spreadEnd - windowStart)
+      for (let i = 0; i < spreadCount; i++) {
+        const idx = spreadCount > 1
+          ? windowStart + Math.round((i * (spreadLen - 1)) / (spreadCount - 1))
+          : windowStart + Math.round((spreadLen - 1) / 2)
+        sampleIndices.add(Math.max(0, Math.min(idx, userTurns.length - 1)))
+      }
     }
 
     selectedTurns = [...sampleIndices]
@@ -172,14 +194,16 @@ ${messageList}`
 
 function cleanTitle(text: string): string | undefined {
   const cleaned = text
-    .replace(/racuse[\s\S]*?<\/think>\s*/g, "")
-    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, "")
+    .replace(/<think[\s\S]*?<\/think>\s*/g, "")
+    .replace(/<think[\s\S]*?(?=\n\n|$)/g, "")
+    .replace(/<thinking[\s\S]*?<\/thinking>\s*/g, "")
+    .replace(/<thinking[\s\S]*?(?=\n\n|$)/g, "")
     .split("\n")
     .map((line) => line.trim())
     .find(Boolean)
-    ?.replace(/^"(.*)"$/, "$1")
+    ?.replace(/^["'](.*)["']$/, "$1")
     .trim()
-  if (!cleaned || cleaned.includes("can't assist with that")) return undefined
+  if (!cleaned || /\b(cannot|can't|can not|won't|unable)\s+(assist|help|fulfill|complete)/i.test(cleaned)) return undefined
   return cleaned.length > 100 ? cleaned.slice(0, 97) + "..." : cleaned
 }
 
@@ -196,12 +220,7 @@ function titleTextFromMessages(messages: readonly MessageWithParts[]): string {
 function pickSessionModel(
   messages: ReadonlyArray<MessageWithParts>,
   providers: ReadonlyArray<Provider>,
-  smallModel?: string,
 ): { providerID: string; modelID: string } | undefined {
-  if (smallModel) {
-    const parsed = parseModelString(smallModel)
-    if (parsed) return parsed
-  }
   for (const msg of messages) {
     if (msg.info?.model?.providerID && msg.info?.model?.modelID) {
       return msg.info.model as { providerID: string; modelID: string }
@@ -213,12 +232,6 @@ function pickSessionModel(
     }
   }
   return undefined
-}
-
-function parseModelString(input: string): { providerID: string; modelID: string } | undefined {
-  const slash = input.indexOf("/")
-  if (slash <= 0 || slash >= input.length - 1) return undefined
-  return { providerID: input.slice(0, slash), modelID: input.slice(slash + 1) }
 }
 
 async function waitForGeneratedTitle(api: TuiPluginApi, childID: string): Promise<string | undefined> {
@@ -267,7 +280,7 @@ async function generateRetitle(api: TuiPluginApi, sessionID: string, rawArgs?: s
     return undefined
   }
 
-  const model = pickSessionModel(messages, api.state.provider, api.state.config.small_model)
+  const model = pickSessionModel(messages, api.state.provider)
   if (!model) throw new Error("Connect a provider before using /retitle")
   retitleLog("model-selected", { sessionID, providerID: model.providerID, modelID: model.modelID })
 
@@ -276,122 +289,290 @@ async function generateRetitle(api: TuiPluginApi, sessionID: string, rawArgs?: s
   const childID = childResp.data!.id
   retitleLog("helper-created", { sessionID, helperSessionID: childID })
 
-  await api.client.session.prompt({
-    sessionID: childID,
-    noReply: false,
-    agent: "title",
-    model,
-    parts: [{ type: "text", text: titlePrompt(sampled, steeringHint), synthetic: true }],
-  })
-  retitleLog("prompt-started", { sessionID, helperSessionID: childID })
+  try {
+    const promptResp = await api.client.session.prompt({
+      sessionID: childID,
+      noReply: false,
+      agent: "title",
+      model,
+      parts: [{ type: "text", text: titlePrompt(sampled, steeringHint), synthetic: true }],
+    })
+    if (promptResp.error) throw new Error("Failed to start retitle prompt: " + String(promptResp.error))
+    retitleLog("prompt-started", { sessionID, helperSessionID: childID })
 
-  return waitForGeneratedTitle(api, childID)
+    return await waitForGeneratedTitle(api, childID)
+  } finally {
+    api.client.session.delete({ sessionID: childID }).catch(() => {})
+  }
 }
 
-async function retitleSession(api: TuiPluginApi, sessionID: string, rawArgs?: string) {
-  api.ui.toast({ variant: "info", title: "Retitle", message: "Analyzing recent messages...", duration: 2500 })
-  const title = await generateRetitle(api, sessionID, rawArgs)
-  if (!title) {
-    retitleLog("no-title", { sessionID })
-    api.ui.toast({
-      variant: "warning",
-      title: "Retitle",
-      message: "Unable to generate a title from this conversation",
-      duration: 5000,
-    })
-    return
-  }
-
+async function applyTitle(api: TuiPluginApi, sessionID: string, title: string): Promise<boolean> {
   const updateResult = await api.client.session.update({ sessionID, title })
   if (updateResult.error) {
     retitleLog("update-error", { sessionID, error: String(updateResult.error) })
     api.ui.toast({ variant: "error", title: "Retitle", message: "Failed to update session title", duration: 5000 })
-    return
+    return false
   }
   retitleLog("updated", { sessionID, titleLength: title.length })
   api.ui.toast({ variant: "success", title: "Retitle", message: "New title: " + title, duration: 6000 })
+  return true
 }
 
-function askArgs(api: TuiPluginApi, sessionID: string) {
-  const options = [
-    {
-      title: "Retitle with defaults",
-      value: "default",
-      description: "Tail-3 sampling, 10 max samples, no hint",
-    },
-    {
-      title: "Retitle — last 20 messages",
-      value: "offset20",
-      description: "--offset 20",
-    },
-    {
-      title: "Retitle — last 50 messages",
-      value: "offset50",
-      description: "--offset 50",
-    },
-    {
-      title: "Retitle — broad sample (20 turns)",
-      value: "broad",
-      description: "--samples 20 --from 50",
-    },
-    {
-      title: "Retitle — with hint…",
-      value: "hint",
-      description: "Enter a custom steering hint",
-    },
-  ]
+// ─── Confirm flow: Apply / Edit / Regenerate / Cancel ─────────────────────────
 
+function showConfirmMenu(
+  api: TuiPluginApi,
+  sessionID: string,
+  title: string,
+  settings: RetitleSettings,
+) {
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
-      title: "Retitle Session",
-      options,
-      current: "default",
-      onSelect: (opt: { title: string; value: string }) => {
-        if (opt.value === "hint") {
-          api.ui.dialog.replace(() =>
-            api.ui.DialogPrompt({
-              title: "Retitle — Steering Hint",
-              placeholder: "e.g. focus on the Docker deployment work",
-              onConfirm: (value: string) => {
-                api.ui.dialog.clear()
-                retitleSession(api, sessionID, value).catch((error) => {
-                  retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
-                  api.ui.toast({
-                    variant: "error",
-                    title: "Retitle failed",
-                    message: error instanceof Error ? error.message : String(error),
-                    duration: 7000,
-                  })
-                })
-              },
-              onCancel: () => {
-                api.ui.dialog.clear()
-                askArgs(api, sessionID)
-              },
-            }),
-          )
-        } else {
-          api.ui.dialog.clear()
-          const argMap: Record<string, string> = {
-            default: "",
-            offset20: "--offset 20",
-            offset50: "--offset 50",
-            broad: "--samples 20 --from 50",
-          }
-          retitleSession(api, sessionID, argMap[opt.value] || "").catch((error) => {
-            retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
-            api.ui.toast({
-              variant: "error",
-              title: "Retitle failed",
-              message: error instanceof Error ? error.message : String(error),
-              duration: 7000,
-            })
-          })
+      title: `Retitle — "${title}"`,
+      skipFilter: true,
+      current: "apply",
+      options: [
+        {
+          title: "Apply",
+          value: "apply",
+          description: "Set this as the session title",
+          onSelect: () => {
+            api.ui.dialog.clear()
+            applyTitle(api, sessionID, title)
+          },
+        },
+        {
+          title: "Edit…",
+          value: "edit",
+          description: "Modify the title before applying",
+          onSelect: () => {
+            showEditPrompt(api, sessionID, title, settings)
+          },
+        },
+        {
+          title: "Regenerate",
+          value: "regenerate",
+          description: "Run again with different settings",
+          onSelect: () => {
+            showSettingsDialog(api, sessionID, settings)
+          },
+        },
+        {
+          title: "Cancel",
+          value: "cancel",
+          description: "Discard this title",
+          onSelect: () => {
+            api.ui.dialog.clear()
+          },
+        },
+      ],
+    }),
+  )
+}
+
+function showEditPrompt(
+  api: TuiPluginApi,
+  sessionID: string,
+  currentTitle: string,
+  settings: RetitleSettings,
+) {
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "Edit title",
+      value: currentTitle,
+      placeholder: "Session title",
+      onConfirm: (value: string) => {
+        const trimmed = value.trim()
+        if (!trimmed) {
+          showConfirmMenu(api, sessionID, currentTitle, settings)
+          return
         }
+        api.ui.dialog.clear()
+        applyTitle(api, sessionID, trimmed)
+      },
+      onCancel: () => {
+        showConfirmMenu(api, sessionID, currentTitle, settings)
       },
     }),
   )
 }
+
+// ─── Generation runner ────────────────────────────────────────────────────────
+
+async function runRetitle(
+  api: TuiPluginApi,
+  sessionID: string,
+  settings: RetitleSettings,
+) {
+  const args = settingsToArgs(settings)
+
+  api.ui.dialog.replace(() =>
+    api.ui.DialogPrompt({
+      title: "Retitle Session",
+      placeholder: "",
+      busy: true,
+      busyText: "Analyzing recent messages...",
+      onConfirm: () => {},
+      onCancel: () => {
+        api.ui.dialog.clear()
+      },
+    }),
+  )
+
+  try {
+    const title = await generateRetitle(api, sessionID, args)
+    if (!title) {
+      retitleLog("no-title", { sessionID })
+      api.ui.dialog.clear()
+      api.ui.toast({
+        variant: "warning",
+        title: "Retitle",
+        message: "Unable to generate a title from this conversation",
+        duration: 5000,
+      })
+      return
+    }
+    showConfirmMenu(api, sessionID, title, settings)
+  } catch (error) {
+    retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
+    api.ui.dialog.clear()
+    api.ui.toast({
+      variant: "error",
+      title: "Retitle failed",
+      message: error instanceof Error ? error.message : String(error),
+      duration: 7000,
+    })
+  }
+}
+
+// ─── Composable settings dialog ───────────────────────────────────────────────
+
+function showSettingsDialog(
+  api: TuiPluginApi,
+  sessionID: string,
+  settings: RetitleSettings,
+) {
+  const buildOpts = () => {
+    const opts: Array<{ title: string; value: string; description?: string; category?: string; onSelect?: () => void }> = [
+      {
+        title: "Retitle with current settings",
+        value: "run",
+        category: "Run",
+        description: `samples=${settings.samples}${settings.offset > 0 ? ` offset=${settings.offset}` : ""}${settings.fromPct !== 100 ? ` from=${settings.fromPct}%` : ""}${settings.steering ? ` hint="${settings.steering}"` : ""}`,
+        onSelect: () => {
+          api.ui.dialog.clear()
+          runRetitle(api, sessionID, settings)
+        },
+      },
+      {
+        title: "Use defaults",
+        value: "reset",
+        category: "Run",
+        description: "Reset to defaults and run",
+        onSelect: () => {
+          const defaults: RetitleSettings = { samples: 10, offset: 0, fromPct: 100, steering: "" }
+          api.ui.dialog.clear()
+          runRetitle(api, sessionID, defaults)
+        },
+      },
+      {
+        title: `Samples: ${settings.samples}`,
+        value: "samples",
+        category: "Adjust",
+        description: "Max user turns to sample (3–50)",
+        onSelect: () => {
+          showNumberPicker(api, "Samples", settings.samples, [3, 5, 10, 15, 20, 30, 50], (v) => {
+            settings.samples = v
+            showSettingsDialog(api, sessionID, settings)
+          })
+        },
+      },
+      {
+        title: `Offset: ${settings.offset > 0 ? settings.offset : "all"}`,
+        value: "offset",
+        category: "Adjust",
+        description: "Use only last N messages",
+        onSelect: () => {
+          showNumberPicker(api, "Offset", settings.offset, [0, 10, 20, 30, 50, 100], (v) => {
+            settings.offset = v
+            showSettingsDialog(api, sessionID, settings)
+          }, "0 = all messages")
+        },
+      },
+      {
+        title: `From: ${settings.fromPct}%`,
+        value: "from",
+        category: "Adjust",
+        description: "Sampling center point (0–100, 100=end)",
+        onSelect: () => {
+          showNumberPicker(api, "From %", settings.fromPct, [0, 25, 50, 75, 100], (v) => {
+            settings.fromPct = v
+            showSettingsDialog(api, sessionID, settings)
+          })
+        },
+      },
+      {
+        title: `Hint: ${settings.steering || "(none)"}`,
+        value: "hint",
+        category: "Adjust",
+        description: "Steering hint for the title model",
+        onSelect: () => {
+          api.ui.dialog.replace(() =>
+            api.ui.DialogPrompt({
+              title: "Steering hint",
+              value: settings.steering,
+              placeholder: "e.g. focus on the Docker deployment work",
+              onConfirm: (value: string) => {
+                settings.steering = value.trim()
+                showSettingsDialog(api, sessionID, settings)
+              },
+              onCancel: () => {
+                showSettingsDialog(api, sessionID, settings)
+              },
+            }),
+          )
+        },
+      },
+    ]
+    return opts
+  }
+
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Retitle Session",
+      skipFilter: true,
+      current: "run",
+      options: buildOpts(),
+    }),
+  )
+}
+
+function showNumberPicker(
+  api: TuiPluginApi,
+  title: string,
+  current: number,
+  choices: number[],
+  onPick: (v: number) => void,
+  description?: string,
+) {
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title,
+      skipFilter: true,
+      current,
+      options: choices.map((v) => ({
+        title: String(v),
+        value: String(v),
+        description: v === current ? "← current" : description,
+        onSelect: () => {
+          onPick(v)
+        },
+      })),
+    }),
+  )
+}
+
+// ─── Plugin entry point ───────────────────────────────────────────────────────
 
 const tui: TuiPlugin = async (api: TuiPluginApi) => {
   api.keymap.registerLayer({
@@ -410,7 +591,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
               ? route.params.sessionID
               : undefined
           if (!sessionID) return
-          askArgs(api, sessionID)
+          const settings: RetitleSettings = { samples: 10, offset: 0, fromPct: 100, steering: "" }
+          showSettingsDialog(api, sessionID, settings)
         },
       },
     ],
