@@ -53,6 +53,17 @@ Or install from npm (if published):
 }
 ```
 
+## Model selection
+
+`/retitle` model resolution order:
+
+1. Settings modal **Model** (saved in `retitle-config.json` under the OpenCode config dir)
+2. `small_model` from `opencode.jsonc` (`provider/model`)
+3. Last session message model
+4. First available provider model
+
+Open `/retitle` and use **Model:** in the settings modal (same pattern as `/execsa`).
+
 ## Requirements
 
 - OpenCode v1.17.7+ (TUI plugin API with `keymap.registerLayer`)

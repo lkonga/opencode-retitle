@@ -1,4 +1,4 @@
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { TuiPlugin, TuiPluginApi, TuiPluginModule, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
 import type { Message, Part, TextPart, Provider } from "@opencode-ai/sdk/v2"
 
 type MessageWithParts = {
@@ -23,9 +23,50 @@ type RetitleSettings = {
   offset: number
   fromPct: number
   steering: string
+  /** provider/model override for this run; empty = use small_model / fallbacks */
+  model: string
 }
 
 const MAX_SAMPLE_TEXT_LENGTH = 200
+
+const RETITLE_CONFIG_PATH = require("path").join(
+  process.env.OPENCODE_CONFIG_DIR || require("path").join(require("os").homedir(), ".config", "opencode"),
+  "retitle-config.json",
+)
+
+type RetitlePersisted = {
+  model?: string
+}
+
+function readRetitleConfig(): RetitlePersisted {
+  try {
+    return JSON.parse(require("fs").readFileSync(RETITLE_CONFIG_PATH, "utf-8"))
+  } catch {
+    return {}
+  }
+}
+
+function writeRetitleConfigVal(key: keyof RetitlePersisted, val: string): void {
+  try {
+    const fs = require("fs")
+    const existing = fs.existsSync(RETITLE_CONFIG_PATH)
+      ? JSON.parse(fs.readFileSync(RETITLE_CONFIG_PATH, "utf-8"))
+      : {}
+    existing[key] = val
+    fs.writeFileSync(RETITLE_CONFIG_PATH, JSON.stringify(existing, null, 2), "utf-8")
+  } catch {}
+}
+
+function defaultSettings(): RetitleSettings {
+  const persisted = readRetitleConfig()
+  return {
+    samples: 10,
+    offset: 0,
+    fromPct: 100,
+    steering: "",
+    model: typeof persisted.model === "string" ? persisted.model : "",
+  }
+}
 
 function retitleLog(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -227,9 +268,11 @@ function pickSessionModel(
   messages: ReadonlyArray<MessageWithParts>,
   providers: ReadonlyArray<Provider>,
   smallModel?: string,
+  overrideModel?: string,
 ): { providerID: string; modelID: string } | undefined {
-  if (smallModel) {
-    const parsed = parseModelString(smallModel)
+  for (const candidate of [overrideModel, smallModel]) {
+    if (!candidate) continue
+    const parsed = parseModelString(candidate)
     if (parsed) return parsed
   }
   for (const msg of messages) {
@@ -243,6 +286,49 @@ function pickSessionModel(
     }
   }
   return undefined
+}
+
+function formatModelLabel(model: { providerID: string; modelID: string } | undefined, override?: string): string {
+  if (override?.trim()) return override.trim()
+  if (model) return `${model.providerID}/${model.modelID}`
+  return "(auto)"
+}
+
+function buildModelOptions(
+  providers: ReadonlyArray<Provider>,
+  current: string,
+): TuiDialogSelectOption<string>[] {
+  const opts: TuiDialogSelectOption<string>[] = [
+    {
+      title: "Use config small_model / auto",
+      value: "",
+      description: current === "" ? "← current" : "Prefer opencode.jsonc small_model, then session/provider fallback",
+      category: "Default",
+    },
+  ]
+
+  for (const provider of providers) {
+    for (const modelID of Object.keys(provider.models ?? {})) {
+      const model = (provider.models as any)?.[modelID]
+      if (model?.status === "deprecated") continue
+      const fullId = `${provider.id}/${modelID}`
+      opts.push({
+        title: model?.name || modelID,
+        value: fullId,
+        description: fullId === current ? "← current" : fullId,
+        category: provider.name || provider.id,
+      })
+    }
+  }
+
+  opts.sort((a, b) => {
+    if (a.value === current) return -1
+    if (b.value === current) return 1
+    if (a.value === "") return -1
+    if (b.value === "") return 1
+    return a.title.localeCompare(b.title)
+  })
+  return opts
 }
 
 async function waitForGeneratedTitle(api: TuiPluginApi, childID: string): Promise<string | undefined> {
@@ -268,8 +354,13 @@ async function waitForGeneratedTitle(api: TuiPluginApi, childID: string): Promis
   return undefined
 }
 
-async function generateRetitle(api: TuiPluginApi, sessionID: string, rawArgs?: string): Promise<string | undefined> {
-  retitleLog("start", { sessionID, hasArgs: Boolean(rawArgs?.trim()) })
+async function generateRetitle(
+  api: TuiPluginApi,
+  sessionID: string,
+  rawArgs?: string,
+  modelOverride?: string,
+): Promise<string | undefined> {
+  retitleLog("start", { sessionID, hasArgs: Boolean(rawArgs?.trim()), modelOverride: modelOverride || "" })
   const { steeringHint, samplingOptions } = parseRetitleArgs(rawArgs)
   retitleLog("messages-fetch", { sessionID })
   const fetchResult = await api.client.session.messages({ sessionID })
@@ -292,9 +383,14 @@ async function generateRetitle(api: TuiPluginApi, sessionID: string, rawArgs?: s
   }
 
   const smallModel = (api.state.config as any)?.small_model as string | undefined
-  const model = pickSessionModel(messages, api.state.provider, smallModel)
+  const model = pickSessionModel(messages, api.state.provider, smallModel, modelOverride)
   if (!model) throw new Error("Connect a provider before using /retitle")
-  retitleLog("model-selected", { sessionID, providerID: model.providerID, modelID: model.modelID })
+  retitleLog("model-selected", {
+    sessionID,
+    providerID: model.providerID,
+    modelID: model.modelID,
+    source: modelOverride ? "settings-override" : smallModel ? "small_model" : "fallback",
+  })
 
   const childResp = await api.client.session.create({ parentID: sessionID, title: "Retitle generation" })
   if (childResp.error) throw new Error("Failed to create retitle helper session")
@@ -432,7 +528,7 @@ async function runRetitle(
   )
 
   try {
-    const title = await generateRetitle(api, sessionID, args)
+    const title = await generateRetitle(api, sessionID, args, settings.model)
     if (!title) {
       retitleLog("no-title", { sessionID })
       api.ui.dialog.clear()
@@ -464,13 +560,15 @@ function showSettingsDialog(
   sessionID: string,
   settings: RetitleSettings,
 ) {
+  const smallModel = (api.state.config as any)?.small_model as string | undefined
+  const effective = settings.model || smallModel || "auto"
   const buildOpts = () => {
     const opts: Array<{ title: string; value: string; description?: string; category?: string; onSelect?: () => void }> = [
       {
         title: "Retitle with current settings",
         value: "run",
         category: "Run",
-        description: `samples=${settings.samples}${settings.offset > 0 ? ` offset=${settings.offset}` : ""}${settings.fromPct !== 100 ? ` from=${settings.fromPct}%` : ""}${settings.steering ? ` hint="${settings.steering}"` : ""}`,
+        description: `model=${effective} samples=${settings.samples}${settings.offset > 0 ? ` offset=${settings.offset}` : ""}${settings.fromPct !== 100 ? ` from=${settings.fromPct}%` : ""}${settings.steering ? ` hint="${settings.steering}"` : ""}`,
         onSelect: () => {
           api.ui.dialog.clear()
           runRetitle(api, sessionID, settings)
@@ -480,11 +578,24 @@ function showSettingsDialog(
         title: "Use defaults",
         value: "reset",
         category: "Run",
-        description: "Reset to defaults and run",
+        description: "Reset sampling/hint defaults and run (keeps saved model)",
         onSelect: () => {
-          const defaults: RetitleSettings = { samples: 10, offset: 0, fromPct: 100, steering: "" }
+          const defaults = defaultSettings()
+          defaults.samples = 10
+          defaults.offset = 0
+          defaults.fromPct = 100
+          defaults.steering = ""
           api.ui.dialog.clear()
           runRetitle(api, sessionID, defaults)
+        },
+      },
+      {
+        title: `Model: ${settings.model || (smallModel ? `config ${smallModel}` : "auto")}`,
+        value: "model",
+        category: "Adjust",
+        description: "LLM for title generation (saved in retitle-config.json)",
+        onSelect: () => {
+          showModelPicker(api, sessionID, settings)
         },
       },
       {
@@ -559,6 +670,42 @@ function showSettingsDialog(
   )
 }
 
+function showModelPicker(
+  api: TuiPluginApi,
+  sessionID: string,
+  settings: RetitleSettings,
+) {
+  const current = settings.model || ""
+  const opts = buildModelOptions(api.state.provider, current)
+  opts.push({ title: "← Back", value: "__back__", category: "Navigation" })
+
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Retitle model",
+      placeholder: "Search models...",
+      current: current || "",
+      options: opts.map((opt) => ({
+        ...opt,
+        onSelect: () => {
+          if (opt.value === "__back__") {
+            showSettingsDialog(api, sessionID, settings)
+            return
+          }
+          settings.model = opt.value
+          writeRetitleConfigVal("model", opt.value)
+          api.ui.toast({
+            variant: "success",
+            title: "Retitle",
+            message: opt.value ? `Model: ${opt.value}` : "Model: config small_model / auto",
+            duration: 4000,
+          })
+          showSettingsDialog(api, sessionID, settings)
+        },
+      })),
+    }),
+  )
+}
+
 function showNumberPicker(
   api: TuiPluginApi,
   title: string,
@@ -603,7 +750,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
               ? route.params.sessionID
               : undefined
           if (!sessionID) return
-          const settings: RetitleSettings = { samples: 10, offset: 0, fromPct: 100, steering: "" }
+          const settings = defaultSettings()
           showSettingsDialog(api, sessionID, settings)
         },
       },
