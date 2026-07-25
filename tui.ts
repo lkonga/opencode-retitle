@@ -331,26 +331,70 @@ function buildModelOptions(
   return opts
 }
 
+const TITLE_POLL_ATTEMPTS = 24 // 24 * 500ms = 12s hard cap
+const FAIL_TOAST_DEBOUNCE_MS = 15 * 60 * 1000
+let lastFailToastAt = 0
+let lastFailToastKey = ""
+let retitleInFlight = false
+
+function assistantErrorFromMessages(messages: readonly MessageWithParts[]): string | undefined {
+  for (const message of [...messages].reverse()) {
+    if (message.info?.role !== "assistant") continue
+    const err = (message.info as any)?.error
+    if (!err) continue
+    if (typeof err === "string" && err.trim()) return err.trim()
+    const dataMsg = err?.data?.message
+    if (typeof dataMsg === "string" && dataMsg.trim()) return dataMsg.trim()
+    const msg = err?.message
+    if (typeof msg === "string" && msg.trim()) return msg.trim()
+    return String(err)
+  }
+  return undefined
+}
+
+function toastFailure(api: TuiPluginApi, key: string, message: string, variant: "warning" | "error" = "warning") {
+  const now = Date.now()
+  if (key === lastFailToastKey && now - lastFailToastAt < FAIL_TOAST_DEBOUNCE_MS) {
+    retitleLog("fail-toast-debounced", { key, message })
+    return
+  }
+  lastFailToastKey = key
+  lastFailToastAt = now
+  api.ui.toast({
+    variant,
+    title: "Retitle",
+    message,
+    duration: 6000,
+  })
+}
+
 async function waitForGeneratedTitle(api: TuiPluginApi, childID: string): Promise<string | undefined> {
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < TITLE_POLL_ATTEMPTS; attempt++) {
     const msgResp = await api.client.session.messages({ sessionID: childID })
     if (msgResp.error) {
       retitleLog("poll-error", { helperSessionID: childID, attempt, error: String(msgResp.error) })
+      // transport blip: retry a few times then fail hard
+      if (attempt >= 5) throw new Error("Failed to poll retitle helper: " + String(msgResp.error))
       await new Promise((resolve) => setTimeout(resolve, 500))
       continue
     }
     const messages: Array<MessageWithParts> = msgResp.data ?? []
+    const assistantError = assistantErrorFromMessages(messages)
+    if (assistantError) {
+      retitleLog("assistant-error", { helperSessionID: childID, attempt, error: assistantError })
+      throw new Error(assistantError)
+    }
     const title = cleanTitle(titleTextFromMessages(messages))
     if (title) {
       retitleLog("title-ready", { helperSessionID: childID, attempt, messageCount: messages.length, titleLength: title.length })
       return title
     }
-    if (attempt === 0 || attempt === 5 || attempt === 15 || attempt === 30 || attempt === 59) {
+    if (attempt === 0 || attempt === 5 || attempt === 10 || attempt === 15 || attempt === TITLE_POLL_ATTEMPTS - 1) {
       retitleLog("title-poll", { helperSessionID: childID, attempt, messageCount: messages.length })
     }
     await new Promise((resolve) => setTimeout(resolve, 500))
   }
-  retitleLog("title-timeout", { helperSessionID: childID, attempts: 60 })
+  retitleLog("title-timeout", { helperSessionID: childID, attempts: TITLE_POLL_ATTEMPTS })
   return undefined
 }
 
@@ -385,6 +429,16 @@ async function generateRetitle(
   const smallModel = (api.state.config as any)?.small_model as string | undefined
   const model = pickSessionModel(messages, api.state.provider, smallModel, modelOverride)
   if (!model) throw new Error("Connect a provider before using /retitle")
+
+  // Fail fast if the chosen provider/model is not present in current provider state.
+  const provider = (api.state.provider ?? []).find((p) => p.id === model.providerID)
+  if (!provider) {
+    throw new Error(`Provider not available: ${model.providerID}/${model.modelID}`)
+  }
+  if (!(provider.models as any)?.[model.modelID]) {
+    throw new Error(`Model not available: ${model.providerID}/${model.modelID}`)
+  }
+
   retitleLog("model-selected", {
     sessionID,
     providerID: model.providerID,
@@ -392,6 +446,7 @@ async function generateRetitle(
     source: modelOverride ? "settings-override" : smallModel ? "small_model" : "fallback",
   })
 
+  // Quiet helper title so notifier noise is obvious if it still fires.
   const childResp = await api.client.session.create({ parentID: sessionID, title: "Retitle generation" })
   if (childResp.error) throw new Error("Failed to create retitle helper session")
   const childID = childResp.data!.id
@@ -512,14 +567,21 @@ async function runRetitle(
   sessionID: string,
   settings: RetitleSettings,
 ) {
+  if (retitleInFlight) {
+    retitleLog("already-running", { sessionID })
+    toastFailure(api, "in-flight", "Retitle already running", "warning")
+    return
+  }
+  retitleInFlight = true
   const args = settingsToArgs(settings)
+  const modelLabel = settings.model || ((api.state.config as any)?.small_model as string | undefined) || "auto"
 
   api.ui.dialog.replace(() =>
     api.ui.DialogPrompt({
       title: "Retitle Session",
       placeholder: "",
       busy: true,
-      busyText: "Analyzing recent messages...",
+      busyText: `Generating title via ${modelLabel}...`,
       onConfirm: () => {},
       onCancel: () => {
         api.ui.dialog.clear()
@@ -530,26 +592,26 @@ async function runRetitle(
   try {
     const title = await generateRetitle(api, sessionID, args, settings.model)
     if (!title) {
-      retitleLog("no-title", { sessionID })
+      retitleLog("no-title", { sessionID, model: modelLabel })
       api.ui.dialog.clear()
-      api.ui.toast({
-        variant: "warning",
-        title: "Retitle",
-        message: "Unable to generate a title from this conversation",
-        duration: 5000,
-      })
+      toastFailure(
+        api,
+        `no-title:${modelLabel}`,
+        `No title from ${modelLabel}. Pick another model in settings.`,
+        "warning",
+      )
+      showSettingsDialog(api, sessionID, settings)
       return
     }
     showConfirmMenu(api, sessionID, title, settings)
   } catch (error) {
-    retitleLog("error", { sessionID, message: error instanceof Error ? error.message : String(error) })
+    const message = error instanceof Error ? error.message : String(error)
+    retitleLog("error", { sessionID, model: modelLabel, message })
     api.ui.dialog.clear()
-    api.ui.toast({
-      variant: "error",
-      title: "Retitle failed",
-      message: error instanceof Error ? error.message : String(error),
-      duration: 7000,
-    })
+    toastFailure(api, `error:${modelLabel}:${message.slice(0, 80)}`, message, "error")
+    showSettingsDialog(api, sessionID, settings)
+  } finally {
+    retitleInFlight = false
   }
 }
 
@@ -561,92 +623,113 @@ function showSettingsDialog(
   settings: RetitleSettings,
 ) {
   const smallModel = (api.state.config as any)?.small_model as string | undefined
+  const modelDisplay = settings.model || (smallModel ? `config ${smallModel}` : "auto")
   const effective = settings.model || smallModel || "auto"
-  const buildOpts = () => {
-    const opts: Array<{ title: string; value: string; description?: string; category?: string; onSelect?: () => void }> = [
-      {
-        title: "Retitle with current settings",
-        value: "run",
-        category: "Run",
-        description: `model=${effective} samples=${settings.samples}${settings.offset > 0 ? ` offset=${settings.offset}` : ""}${settings.fromPct !== 100 ? ` from=${settings.fromPct}%` : ""}${settings.steering ? ` hint="${settings.steering}"` : ""}`,
-        onSelect: () => {
+
+  // Execsa-style: options + top-level onSelect (not per-option onSelect).
+  const options: TuiDialogSelectOption<string>[] = [
+    {
+      title: "Retitle with current settings",
+      value: "run",
+      category: "Run",
+      description: `model=${effective} samples=${settings.samples}${settings.offset > 0 ? ` offset=${settings.offset}` : ""}${settings.fromPct !== 100 ? ` from=${settings.fromPct}%` : ""}${settings.steering ? ` hint="${settings.steering}"` : ""}`,
+    },
+    {
+      title: "Use defaults",
+      value: "reset",
+      category: "Run",
+      description: "Reset sampling/hint defaults and run (keeps saved model)",
+    },
+    {
+      title: `Model: ${modelDisplay}`,
+      value: "model",
+      category: "Adjust",
+      description: "LLM for title generation (saved in retitle-config.json)",
+    },
+    {
+      title: `Samples: ${settings.samples}`,
+      value: "samples",
+      category: "Adjust",
+      description: "Max user turns to sample (3–50)",
+    },
+    {
+      title: `Offset: ${settings.offset > 0 ? settings.offset : "all"}`,
+      value: "offset",
+      category: "Adjust",
+      description: "Use only last N messages",
+    },
+    {
+      title: `From: ${settings.fromPct}%`,
+      value: "from",
+      category: "Adjust",
+      description: "Sampling center point (0–100, 100=end)",
+    },
+    {
+      title: `Hint: ${settings.steering || "(none)"}`,
+      value: "hint",
+      category: "Adjust",
+      description: "Steering hint for the title model",
+    },
+  ]
+
+  try { api.ui.dialog.setSize("medium") } catch {}
+  api.ui.dialog.replace(() =>
+    api.ui.DialogSelect({
+      title: "Retitle Session",
+      options,
+      current: "run",
+      onSelect: (opt) => {
+        const value = opt?.value
+        if (!value) return
+        if (value === "run") {
           api.ui.dialog.clear()
-          runRetitle(api, sessionID, settings)
-        },
-      },
-      {
-        title: "Use defaults",
-        value: "reset",
-        category: "Run",
-        description: "Reset sampling/hint defaults and run (keeps saved model)",
-        onSelect: () => {
+          void runRetitle(api, sessionID, settings)
+          return
+        }
+        if (value === "reset") {
           const defaults = defaultSettings()
           defaults.samples = 10
           defaults.offset = 0
           defaults.fromPct = 100
           defaults.steering = ""
+          // keep model from defaults/persisted
           api.ui.dialog.clear()
-          runRetitle(api, sessionID, defaults)
-        },
-      },
-      {
-        title: `Model: ${settings.model || (smallModel ? `config ${smallModel}` : "auto")}`,
-        value: "model",
-        category: "Adjust",
-        description: "LLM for title generation (saved in retitle-config.json)",
-        onSelect: () => {
+          void runRetitle(api, sessionID, defaults)
+          return
+        }
+        if (value === "model") {
           showModelPicker(api, sessionID, settings)
-        },
-      },
-      {
-        title: `Samples: ${settings.samples}`,
-        value: "samples",
-        category: "Adjust",
-        description: "Max user turns to sample (3–50)",
-        onSelect: () => {
+          return
+        }
+        if (value === "samples") {
           showNumberPicker(api, "Samples", settings.samples, [3, 5, 10, 15, 20, 30, 50], (v) => {
             settings.samples = v
             showSettingsDialog(api, sessionID, settings)
           })
-        },
-      },
-      {
-        title: `Offset: ${settings.offset > 0 ? settings.offset : "all"}`,
-        value: "offset",
-        category: "Adjust",
-        description: "Use only last N messages",
-        onSelect: () => {
+          return
+        }
+        if (value === "offset") {
           showNumberPicker(api, "Offset", settings.offset, [0, 10, 20, 30, 50, 100], (v) => {
             settings.offset = v
             showSettingsDialog(api, sessionID, settings)
           }, "0 = all messages")
-        },
-      },
-      {
-        title: `From: ${settings.fromPct}%`,
-        value: "from",
-        category: "Adjust",
-        description: "Sampling center point (0–100, 100=end)",
-        onSelect: () => {
+          return
+        }
+        if (value === "from") {
           showNumberPicker(api, "From %", settings.fromPct, [0, 25, 50, 75, 100], (v) => {
             settings.fromPct = v
             showSettingsDialog(api, sessionID, settings)
           })
-        },
-      },
-      {
-        title: `Hint: ${settings.steering || "(none)"}`,
-        value: "hint",
-        category: "Adjust",
-        description: "Steering hint for the title model",
-        onSelect: () => {
+          return
+        }
+        if (value === "hint") {
           api.ui.dialog.replace(() =>
             api.ui.DialogPrompt({
               title: "Steering hint",
               value: settings.steering,
               placeholder: "e.g. focus on the Docker deployment work",
-              onConfirm: (value: string) => {
-                settings.steering = value.trim()
+              onConfirm: (textValue: string) => {
+                settings.steering = textValue.trim()
                 showSettingsDialog(api, sessionID, settings)
               },
               onCancel: () => {
@@ -654,18 +737,8 @@ function showSettingsDialog(
               },
             }),
           )
-        },
+        }
       },
-    ]
-    return opts
-  }
-
-  api.ui.dialog.replace(() =>
-    api.ui.DialogSelect({
-      title: "Retitle Session",
-      skipFilter: true,
-      current: "run",
-      options: buildOpts(),
     }),
   )
 }
@@ -676,32 +749,32 @@ function showModelPicker(
   settings: RetitleSettings,
 ) {
   const current = settings.model || ""
-  const opts = buildModelOptions(api.state.provider, current)
+  const opts = buildModelOptions(api.state.provider ?? [], current)
   opts.push({ title: "← Back", value: "__back__", category: "Navigation" })
 
+  try { api.ui.dialog.setSize("medium") } catch {}
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
       title: "Retitle model",
       placeholder: "Search models...",
       current: current || "",
-      options: opts.map((opt) => ({
-        ...opt,
-        onSelect: () => {
-          if (opt.value === "__back__") {
-            showSettingsDialog(api, sessionID, settings)
-            return
-          }
-          settings.model = opt.value
-          writeRetitleConfigVal("model", opt.value)
-          api.ui.toast({
-            variant: "success",
-            title: "Retitle",
-            message: opt.value ? `Model: ${opt.value}` : "Model: config small_model / auto",
-            duration: 4000,
-          })
+      options: opts,
+      onSelect: (opt) => {
+        const value = opt?.value
+        if (value === undefined || value === "__back__") {
           showSettingsDialog(api, sessionID, settings)
-        },
-      })),
+          return
+        }
+        settings.model = value
+        writeRetitleConfigVal("model", value)
+        api.ui.toast({
+          variant: "success",
+          title: "Retitle",
+          message: value ? `Model: ${value}` : "Model: config small_model / auto",
+          duration: 4000,
+        })
+        showSettingsDialog(api, sessionID, settings)
+      },
     }),
   )
 }
@@ -717,16 +790,17 @@ function showNumberPicker(
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
       title,
-      skipFilter: true,
-      current,
       options: choices.map((v) => ({
         title: String(v),
         value: String(v),
         description: v === current ? "← current" : description,
-        onSelect: () => {
-          onPick(v)
-        },
       })),
+      current: String(current),
+      onSelect: (opt) => {
+        const n = Number(opt?.value)
+        if (!Number.isFinite(n)) return
+        onPick(n)
+      },
     }),
   )
 }
