@@ -209,7 +209,7 @@ async function generateRetitle(
     sessionID,
     providerID: model.providerID,
     modelID: model.modelID,
-    source: settings.model ? "settings-override" : agentModel ? "title-agent" : "fallback",
+    modelSource: settings.model ? "settings-override" : agentModel ? "title-agent" : "fallback",
   })
 
   const helper = await context.client.session.create({

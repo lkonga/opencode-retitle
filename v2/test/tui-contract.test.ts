@@ -21,6 +21,11 @@ describe("V2 TUI public contract", () => {
     expect(source).not.toContain("packages/core/src/")
   })
 
+  test("keeps the V2 log source distinct from model selection", () => {
+    expect(source).toContain('modelSource: settings.model ? "settings-override"')
+    expect(source).not.toContain('source: settings.model ? "settings-override"')
+  })
+
   test("exports the directory-resolved TUI entrypoint", () => {
     expect(pkg.exports["./tui"]).toBe("./tui.tsx")
   })
