@@ -29,7 +29,7 @@ V2 TUI plugins are declared in `cli.json`'s `plugins` array
 ```json
 {
   "plugins": [
-    "/home/lkonga/codes/opencode-plugins/opencode-retitle/.worktrees/retitle/v2/tui.tsx"
+    "/home/lkonga/codes/opencode-plugins/opencode-retitle/.worktrees/retitle/v2"
   ]
 }
 ```
@@ -39,7 +39,7 @@ serializes writers with `flock`):
 
 ```bash
 scripts/v2-register-plugin.sh \
-  --tui /home/lkonga/codes/opencode-plugins/opencode-retitle/.worktrees/retitle/v2/tui.tsx \
+  --tui /home/lkonga/codes/opencode-plugins/opencode-retitle/.worktrees/retitle/v2 \
   --label issue-226
 ```
 
@@ -50,7 +50,7 @@ scripts/v2-register-plugin.sh \
 | Plugin module | `Plugin.define({ id, setup })` | `packages/plugin/src/tui/plugin.ts:7,12` |
 | Plugin context | `Plugin.Context` | `packages/plugin/src/tui/context.ts:466` |
 | Mount a component | `context.ui.slot({ append: "app", render })` | `packages/plugin/src/tui/context.ts:463` |
-| Register commands | `context.keymap.layer(() => KeymapLayer)` | `packages/plugin/src/tui/context.ts:412` |
+| Register commands | `context.keymap.layer(() => KeymapLayer)` with `mode: "global"` | `packages/plugin/src/tui/context.ts:382-395,412` |
 | Command shape | `{ id, title, description, group, palette, slash, run }` | `packages/plugin/src/tui/context.ts:354-380` |
 | Slash + raw args | `slash: { name: "retitle", arguments: true }` | `packages/plugin/src/tui/context.ts:370-375` |
 | Dialogs | `context.ui.dialog.select/prompt` | `packages/plugin/src/tui/context.ts:350-351` |
@@ -73,7 +73,8 @@ No keybind is invented. Unknown **keybind config** ids are fatal
 (`packages/tui/src/config/keybind.ts:316`, `Unrecognized keybind...`), so the
 command carries only a command `id` plus `palette`/`slash` and no `bind` — the
 same shape as the proven `opencode-pool-guard/v2` and `opencode-execsa/v2`
-ports.
+ports. The layer is global because prompt slash completion and the command
+palette cannot reach a base-mode layer (`packages/tui/src/context/keymap.tsx`).
 
 ## Behaviour mapping (V1 → V2)
 
