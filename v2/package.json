@@ -1,0 +1,13 @@
+{
+  "name": "opencode-retitle-v2",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tui": "./tui.tsx",
+    "./core": "./retitle-core.ts",
+    "./config": "./config.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}
