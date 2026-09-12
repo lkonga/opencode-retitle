@@ -507,6 +507,7 @@ async function openRetitle(context: Ctx, rawArgs: string): Promise<void> {
 
 function Commands(props: { context: Ctx }) {
   props.context.keymap.layer(() => ({
+    mode: "global",
     commands: [
       {
         id: "retitle.session.retitle",
