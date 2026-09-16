@@ -100,7 +100,7 @@ describe("model resolution", () => {
     })
   })
 
-  test("falls back to the last assistant model, then the first catalogue model", async () => {
+  test("falls back to the assistant model, then the first catalogue model", async () => {
     const client = fakeClient().client
 
     const fromMessages = adapterFor({ client, catalog: fakeCatalog() }).adapter
