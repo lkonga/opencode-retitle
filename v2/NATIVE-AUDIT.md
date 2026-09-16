@@ -7,7 +7,7 @@ sources, both consulted for this port:
 | Source | Identity |
 |---|---|
 | Pinned public source | `/home/lkonga/codes/opencode-v2-scrollfix` @ `c5f4ce3d66` |
-| Installed runtime | `~/.opencode/bin/opencode-v2`, `opencode2 v2.0.3-dev-patched-e3ee3d3cb1`; live spec `GET http://127.0.0.1:49375/openapi.json` (read 2026-09-16) |
+| Installed runtime | `~/.opencode/bin/opencode-v2`, `opencode2 v2.0.3-dev-patched-aadf102ad0`; live spec `GET http://127.0.0.1:49375/openapi.json` (read 2026-09-16) |
 
 The two are different revisions of the same tree. Where they disagree, the
 disagreement is called out — it is the reason the plugin only ever calls
@@ -176,6 +176,6 @@ The native auto-titler is not affected by this decision and keeps using
 stale `agents.title.model` still degrades automatic titling — fixing the config
 is worthwhile for that reason, not for `/retitle`.
 
-The plugin is also not currently listed in the live `cli.json` `plugins` array,
-so the V2 TUI does not load it yet. Registration there is one entry, never two
-(listing the same directory twice would register the keymap layer twice).
+The plugin is listed exactly once in the live `cli.json` `plugins` array, so the
+V2 TUI loads it without duplicate command registration. Listing the same
+directory twice would register the keymap layer twice.
