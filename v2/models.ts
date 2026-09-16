@@ -10,11 +10,24 @@
 //   settings override -> title agent model (V1 `small_model`) -> session model
 //   -> first assistant message model -> first enabled, non-deprecated catalogue model
 //
-// A configured override is never silently replaced: if the catalogue is loaded
-// and does not contain it, the run fails with an actionable message instead of
-// quietly generating with a different model.
+// Two different kinds of failure are handled differently on purpose:
+//
+//   * The **settings override** is an explicit user choice, so it is strict and
+//     fail-closed: if the catalogue is loaded and does not contain it, the run
+//     fails with an actionable message instead of quietly generating with a
+//     different model.
+//   * The **title agent model** is inherited configuration, not a choice made
+//     for this run. It is preferred only when the loaded catalogue carries it;
+//     a stale value (e.g. a provider that no longer exists in this runtime) is
+//     skipped and the chain continues to the session model, the first assistant
+//     message's model, or the first enabled catalogue model. No model is ever
+//     hardcoded.
+//
+// Both rules share one caveat: an *empty* catalogue means the read failed, not
+// that a model is invalid, so nothing is skipped in that case.
 
 import {
+  assistantMessageModel,
   buildModelOptions,
   isModelAvailable,
   modelKey,
@@ -23,12 +36,13 @@ import {
   type AvailableModel,
   type ModelOption,
   type ModelRef,
+  type ModelSource,
   type RetitleMessage,
 } from "./retitle-core"
 import { RetitleError } from "./errors"
 
 export { modelKey } from "./retitle-core"
-export type { AvailableModel, ModelOption, ModelRef }
+export type { AvailableModel, ModelOption, ModelRef, ModelSource }
 
 export interface AgentLike {
   readonly id: string
@@ -95,52 +109,88 @@ function toRef(value: ModelRefLike | null | undefined): ModelRef | undefined {
 }
 
 export type ResolveModelInput = {
-  /** Persisted `provider/model` override. Highest priority. */
+  /** Persisted `provider/model` override. Highest priority, and fail-closed. */
   readonly override?: string
   readonly source: CatalogSource
   readonly sessionModel?: ModelRefLike | null
   readonly messages?: ReadonlyArray<RetitleMessage>
 }
 
+/** A preference candidate the loaded catalogue rejected. */
+export type SkippedModel = {
+  readonly model: ModelRef
+  readonly source: ModelSource
+}
+
+export type ModelResolution = {
+  readonly model: ModelRef
+  readonly source: ModelSource
+  /** Preference candidates that were stale, in preference order. Metadata only. */
+  readonly skipped: ReadonlyArray<SkippedModel>
+}
+
 /**
- * Picks the generation model and validates it against the loaded catalogue.
+ * Picks the generation model, validating each preference against the loaded
+ * catalogue.
  *
- * @throws RetitleError("model") when a configured override is unknown, when the
- * catalogue is loaded but the selection is absent, or when nothing can serve
- * the request at all.
+ * @throws RetitleError("model") when an explicit override is malformed or the
+ * loaded catalogue does not carry it, and when nothing at all can serve the
+ * request.
  */
-export function resolveTitleModel(input: ResolveModelInput): ModelRef {
-  const override = input.override?.trim()
-  if (override && !parseModelString(override)) {
-    throw new RetitleError("model", `Invalid model reference in settings: ${override}`)
-  }
-
+export function resolveTitleModel(input: ResolveModelInput): ModelResolution {
   const available = listModels(input.source)
-  const agentModel = titleAgentModel(input.source)
-  const model = pickModel({
-    override,
-    agentModel: agentModel ? { providerID: agentModel.providerID, id: agentModel.modelID, variant: agentModel.variant } : undefined,
-    sessionModel: input.sessionModel,
-    messages: input.messages,
-    available,
-  })
-  if (!model) {
-    throw new RetitleError("model", "Connect a provider before using /retitle")
+  const catalogLoaded = available.length > 0
+  const usable = (model: ModelRef): boolean => !catalogLoaded || isModelAvailable(model, available)
+
+  const override = input.override?.trim()
+  if (override) {
+    const parsed = parseModelString(override)
+    if (!parsed) {
+      throw new RetitleError("model", `Invalid model reference in settings: ${override}`)
+    }
+    // Strict and fail-closed: an explicit choice is never silently replaced.
+    if (!usable(parsed)) {
+      throw new RetitleError(
+        "model",
+        `Model from settings is not available in this runtime: ${modelKey(parsed)}`,
+      )
+    }
   }
 
-  // The catalogue is authoritative when it is loaded. An empty catalogue means
-  // the read failed, not that the model is invalid, so it is not a failure.
-  if (available.length > 0 && !isModelAvailable(model, available)) {
-    const label = modelKey(model)
+  const agentModel = titleAgentModel(input.source)
+  const sessionModel = toRef(input.sessionModel)
+  const assistantModel = assistantMessageModel(input.messages)
+
+  const picked = pickModel({
+    override,
+    agentModel,
+    sessionModel,
+    assistantModel,
+    available,
+    usable,
+  })
+  if (!picked) {
     throw new RetitleError(
       "model",
-      override
-        ? `Model from settings is not available in this runtime: ${label}`
-        : `Model not available: ${label}`,
+      catalogLoaded
+        ? "No usable model for /retitle: every model in the catalogue is disabled or deprecated"
+        : "Connect a provider before using /retitle",
     )
   }
 
-  return model
+  const skipped: SkippedModel[] = catalogLoaded
+    ? [
+        { model: agentModel, source: "title-agent" as const },
+        { model: sessionModel, source: "session" as const },
+        { model: assistantModel, source: "assistant-message" as const },
+      ].flatMap((candidate) =>
+        candidate.model && !usable(candidate.model)
+          ? [{ model: candidate.model, source: candidate.source }]
+          : [],
+      )
+    : []
+
+  return { model: picked.model, source: picked.source, skipped }
 }
 
 export function modelOptions(source: CatalogSource, current: string): ModelOption[] {

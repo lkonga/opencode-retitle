@@ -13,15 +13,35 @@
 // (`packages/tui/src/context/keymap.tsx:303-330`), so a base-mode layer would
 // be filtered out exactly when /retitle needs to be offered. Global layers
 // register with no mode field and match every mode.
+//
+// `bind` is present, and it is a **fixed** stroke, not a config keybind:
+//
+//   * A reachable V2 command carries a raw binding, so the command is one
+//     reachable entry with both its palette/slash reachability and its key
+//     stroke — not a palette-only entry that happens to be reachable.
+//   * The binding is deliberately NOT declared in the runtime's canonical
+//     `cli.json` keybind table. `TuiKeybind.parse` rejects any key it does not
+//     know (`packages/tui/src/config/keybind.ts`, `parse`/`unknownKeys`), so a
+//     user who adds `retitle.session.retitle` to `keybinds` gets a fatal
+//     "Unrecognized keybind" instead of a remap. The stroke therefore ships
+//     with the plugin and cannot be remapped without editing this file.
+//   * `ctrl+shift+r` was checked against all 218 TUI default bindings in
+//     `packages/tui/src/config/keybind.ts` (no collision; the nearest
+//     neighbours are `session.rename` = `ctrl+r`, `session.tab.reopen` =
+//     `ctrl+shift+t`, `input.delete.line` = `ctrl+shift+d`) and against the
+//     live `keybinds` block of `<config>/cli.json`. See `v2/README.md`.
 
 export const RETITLE_COMMAND_ID = "retitle.session.retitle"
 export const RETITLE_SLASH_NAME = "retitle"
+/** Fixed, non-remappable key stroke for the command (see the header). */
+export const RETITLE_BIND = "ctrl+shift+r"
 
 export interface RetitleKeymapCommand {
   readonly id: string
   readonly title: string
   readonly description: string
   readonly group: string
+  readonly bind: string
   readonly palette: true
   readonly slash: { readonly name: string; readonly arguments: true }
   readonly run: (input?: string) => void
@@ -41,6 +61,7 @@ export function createRetitleCommand(
     title: "Retitle Session (Recent)",
     description: "Retitle the session from sampled recent turns. Args: [hint], --samples N, --from P%, --offset N",
     group: "Session",
+    bind: RETITLE_BIND,
     palette: true,
     slash: { name: RETITLE_SLASH_NAME, arguments: true },
     run: (input) => {

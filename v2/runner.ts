@@ -71,12 +71,9 @@ export async function executeRetitle(ports: RetitlePorts, input: RetitleRunInput
     if (sampled.length === 0) return { status: "empty", messageCount: messages.length }
 
     const model = await ports.resolveModel(input.sessionID, messages, input.settings.model)
-    logger?.event("model-selected", {
-      sessionID: input.sessionID,
-      providerID: model.providerID,
-      modelID: model.modelID,
-      modelSource: input.settings.model ? "settings-override" : "fallback",
-    })
+    // The model's provenance is logged by the adapter that resolved it
+    // (`model-selected`: model ids, chain step, stale-preference count) — all
+    // metadata, never the prompt or the transcript.
 
     const raw = await ports.generateTitle({
       sessionID: input.sessionID,

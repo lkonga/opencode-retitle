@@ -118,4 +118,15 @@ describe("createRetitleLogger", () => {
     expect(logPath({})).toBe(DEFAULT_LOG_PATH)
     expect(logPath({ OPENCODE_RETITLE_LOG: "/tmp/custom.log" })).toBe("/tmp/custom.log")
   })
+
+  test("never resolves a log path out of the V1 config environment", () => {
+    // V1 read its settings from `$OPENCODE_CONFIG_DIR || ~/.config/opencode`.
+    // The V2 log path is independent of it: neither variable can move the log
+    // away from the plugin's own path or the /tmp default.
+    expect(logPath({ OPENCODE_CONFIG_DIR: "/home/someone/.config/opencode" })).toBe(DEFAULT_LOG_PATH)
+    expect(logPath({ OPENCODE_CONFIG_DIR: "/x", HOME: "/home/someone", XDG_CONFIG_HOME: "/home/someone/.config" })).toBe(
+      DEFAULT_LOG_PATH,
+    )
+    expect(logPath({ OPENCODE_RETITLE_LOG: "/tmp/custom.log", OPENCODE_CONFIG_DIR: "/x" })).toBe("/tmp/custom.log")
+  })
 })

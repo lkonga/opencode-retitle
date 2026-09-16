@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  assistantMessageModel,
   buildModelOptions,
   cleanTitle,
   isModelAvailable,
@@ -158,16 +159,47 @@ describe("model helpers", () => {
     expect(parseModelString("trailing/")).toBeUndefined()
   })
 
-  test("pickModel follows override -> title agent -> session -> message -> catalog", () => {
-    const messages = [assistant("a", { providerID: "msg", modelID: "m" })]
+  test("pickModel follows override -> title agent -> session -> assistant -> catalog", () => {
+    const assistantModel = { providerID: "msg", modelID: "m" }
+    const agentModel = { providerID: "p", modelID: "agent" }
+    const sessionModel = { providerID: "s", modelID: "sess" }
     const available = [{ id: "first", providerID: "catalog" }]
 
-    expect(pickModel({ override: "over/ride", agentModel: { id: "agent", providerID: "p" }, messages, available })?.providerID).toBe("over")
-    expect(pickModel({ agentModel: { id: "agent", providerID: "p" }, messages, available })).toEqual({ providerID: "p", modelID: "agent" })
-    expect(pickModel({ sessionModel: { id: "sess", providerID: "s" }, messages, available })).toEqual({ providerID: "s", modelID: "sess" })
-    expect(pickModel({ messages, available })).toEqual({ providerID: "msg", modelID: "m" })
-    expect(pickModel({ available })).toEqual({ providerID: "catalog", modelID: "first" })
+    expect(pickModel({ override: "over/ride", agentModel, assistantModel, available })).toEqual({
+      model: { providerID: "over", modelID: "ride" },
+      source: "settings-override",
+    })
+    expect(pickModel({ agentModel, assistantModel, available })).toEqual({ model: agentModel, source: "title-agent" })
+    expect(pickModel({ sessionModel, assistantModel, available })).toEqual({ model: sessionModel, source: "session" })
+    expect(pickModel({ assistantModel, available })).toEqual({ model: assistantModel, source: "assistant-message" })
+    expect(pickModel({ available })).toEqual({ model: { providerID: "catalog", modelID: "first" }, source: "catalog" })
     expect(pickModel({ available: [] })).toBeUndefined()
+  })
+
+  test("pickModel skips a candidate the caller rejects and continues the chain", () => {
+    const stale = { providerID: "9router", modelID: "gone" }
+    const session = { providerID: "session", modelID: "live" }
+    const usable = (model: { providerID: string; modelID: string }) => model.providerID !== "9router"
+
+    expect(pickModel({ agentModel: stale, sessionModel: session, usable })).toEqual({
+      model: session,
+      source: "session",
+    })
+    // Nothing left in the chain: the catalogue fallback is the caller's job to
+    // accept, so an empty catalogue yields no pick at all.
+    expect(pickModel({ agentModel: stale, usable, available: [] })).toBeUndefined()
+  })
+
+  test("assistantMessageModel reads the first model seen on an assistant turn", () => {
+    expect(assistantMessageModel()).toBeUndefined()
+    expect(assistantMessageModel([user("q"), assistant("a")])).toBeUndefined()
+    expect(
+      assistantMessageModel([
+        user("q"),
+        assistant("a", { providerID: "first", modelID: "m" }),
+        assistant("b", { providerID: "second", modelID: "n" }),
+      ]),
+    ).toEqual({ providerID: "first", modelID: "m" })
   })
 
   test("catalog fallback skips disabled and deprecated models", () => {
@@ -176,7 +208,7 @@ describe("model helpers", () => {
       { id: "off", providerID: "p", enabled: false },
       { id: "ok", providerID: "p" },
     ]
-    expect(pickModel({ available })).toEqual({ providerID: "p", modelID: "ok" })
+    expect(pickModel({ available })).toEqual({ model: { providerID: "p", modelID: "ok" }, source: "catalog" })
   })
 
   test("modelKey and isModelAvailable", () => {

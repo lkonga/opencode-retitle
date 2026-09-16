@@ -1,11 +1,14 @@
-// Public-boundary and V1-preservation guards for the V2 port.
+// Boundary guards for the V2 port.
 //
-// These are negative/structural constraints that cannot be expressed as a
-// runtime behaviour, so they are asserted directly:
-//   * the directory entrypoint the V2 loader resolves (`<dir>/tui`);
-//   * the runtime specifier the V2 binary maps for external TUI plugins;
-//   * the absence of any V1 config-directory path in the V2 sources;
-//   * byte-identical V1 files.
+// Everything asserted here is a fact about the *artifact* — which file the V2
+// loader resolves, which modules exist in the V2 graph, which of them may touch
+// the filesystem, and which files are frozen — rather than a runtime behaviour.
+// The module-graph assertions are made against a real parse of every V2 source
+// (`Bun.Transpiler.scan`), so they do not break on formatting, quoting or
+// comment changes the way a source substring match would. The behavioural
+// counterparts live in the other test files: settings use only the host's
+// durable storage (`adapter.test.ts`), and the log path ignores the V1 config
+// environment (`logger.test.ts`).
 
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
@@ -17,12 +20,33 @@ const root = path.resolve(v2, "..")
 
 const read = (file: string) => fs.readFileSync(file, "utf8")
 const sha256 = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex")
-/** Strips `//` comments so structural counts describe code, not prose. */
+/** Strips `//` comments so structural scans describe code, not prose. */
 const code = (source: string) =>
   source
     .split("\n")
     .map((line) => line.replace(/\/\/.*$/, ""))
     .join("\n")
+
+/** Every TypeScript source of the V2 plugin (tests excluded). */
+const V2_MODULES = fs
+  .readdirSync(v2, { withFileTypes: true })
+  .filter((entry) => entry.isFile() && /\.tsx?$/.test(entry.name))
+  .map((entry) => entry.name)
+
+/** Parsed import specifiers of one module — a parse, not a substring match. */
+function importsOf(file: string): string[] {
+  const transpiler = new Bun.Transpiler({ loader: file.endsWith(".tsx") ? "tsx" : "ts" })
+  return transpiler.scan(read(file)).imports.map((item) => item.path)
+}
+
+/** Resolves a relative specifier the way the loader would, if it exists. */
+function resolvesTo(fromFile: string, specifier: string): string | undefined {
+  const base = path.resolve(path.dirname(fromFile), specifier)
+  for (const candidate of [base, `${base}.ts`, `${base}.tsx`, path.join(base, "index.ts")]) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate
+  }
+  return undefined
+}
 
 /** V1 files are frozen: update these only as part of an explicit V1 change. */
 const V1_HASHES = {
@@ -36,20 +60,30 @@ describe("V2 entrypoint", () => {
   test("exposes the directory-resolved ./tui entrypoint the loader resolves", () => {
     expect(pkg.exports["./tui"]).toBe("./tui.tsx")
     // resolveLocal() joins `<dir>/tui` and resolves it as a path, so the file
-    // must exist with a resolvable extension.
+    // must exist with a resolvable extension — and a `tui.ts` sibling must not
+    // exist, or the loader's extension order decides which one wins.
     expect(fs.existsSync(path.join(v2, "tui.tsx"))).toBe(true)
     expect(fs.existsSync(path.join(v2, "tui.ts"))).toBe(false)
   })
 
-  test("imports only the runtime-mapped plugin specifier", () => {
-    const source = read(path.join(v2, "tui.tsx"))
-    expect(source).toContain('from "@opencode/plugin/tui"')
-    expect(source).not.toContain("packages/tui/src/")
-    expect(source).not.toContain("packages/core/src/")
-    expect(source).not.toContain("@opencode-ai/plugin")
+  test("imports only the runtime-mapped plugin specifier at the top level", () => {
+    const tui = path.join(v2, "tui.tsx")
+    const bare = importsOf(tui).filter((specifier) => !specifier.startsWith("."))
+    expect(bare).toEqual(["@opencode/plugin/tui"])
+
+    // Every internal import resolves inside the V2 directory.
+    for (const specifier of importsOf(tui).filter((item) => item.startsWith("."))) {
+      const target = resolvesTo(tui, specifier)
+      expect(target, `${specifier} must resolve`).toBeDefined()
+      expect(path.relative(v2, target as string).startsWith("..")).toBe(false)
+    }
   })
 
   test("mounts one app slot and registers one keymap layer", () => {
+    // The one guarantee a local test cannot observe behaviourally: the plugin
+    // is activated by the runtime, and only the runtime can say how many times
+    // `setup` ran. Counted on comment-stripped source; the runtime smoke on the
+    // V2 binary (recorded on issue #239) covers the behavioural side.
     const source = code(read(path.join(v2, "tui.tsx")))
     expect(source.match(/ui\.slot\(/g)).toHaveLength(1)
     expect(source.match(/keymap\.layer\(/g)).toHaveLength(1)
@@ -58,45 +92,45 @@ describe("V2 entrypoint", () => {
   })
 })
 
+describe("V2 module graph", () => {
+  test("no V2 module imports the V1 entrypoint", () => {
+    const v1Entry = path.join(root, "tui.ts")
+    const offenders = V2_MODULES.filter((file) =>
+      importsOf(path.join(v2, file))
+        .filter((specifier) => specifier.startsWith("."))
+        .some((specifier) => resolvesTo(path.join(v2, file), specifier) === v1Entry),
+    )
+    expect(offenders).toEqual([])
+  })
+
+  test("the log file is the only file any V2 module can open", () => {
+    // V1 resolved its settings from `$OPENCODE_CONFIG_DIR || ~/.config/opencode`
+    // and wrote `retitle-config.json` there. V2 keeps its state in the host's
+    // durable storage, so no V2 module needs a filesystem or OS import other
+    // than the log append, and the log path is asserted behaviourally in
+    // `logger.test.ts` to ignore the V1 config environment.
+    const filesystemImporters = V2_MODULES.filter((file) =>
+      importsOf(path.join(v2, file)).some((specifier) => /^(node:)?(fs|os|path)$/.test(specifier)),
+    )
+    expect(filesystemImporters).toEqual(["logger.ts"])
+  })
+
+  test("no V2 source names a V1 config location in executable code", () => {
+    // Names, not formatting: these identifiers cannot appear in code that is
+    // supposed to reach the V2 state root only. Comments may name them to
+    // explain why they are never used, so comments are stripped first.
+    const markers = ["OPENCODE_CONFIG_DIR", "retitle-config", "homedir"]
+    const offenders = V2_MODULES.filter((file) => markers.some((marker) => code(read(path.join(v2, file))).includes(marker)))
+    expect(offenders).toEqual([])
+  })
+})
+
 describe("V1 isolation", () => {
-  test("no V2 source can reach the V1 config directory", () => {
-    const offenders = fs
-      .readdirSync(v2, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && /\.(ts|tsx)$/.test(entry.name))
-      .filter((entry) => {
-        // Executable patterns only: comments may name the V1 path to explain
-        // why it is never used.
-        const source = code(read(path.join(v2, entry.name)))
-        return (
-          source.includes("process.env.OPENCODE_CONFIG_DIR") ||
-          source.includes("retitle-config") ||
-          source.includes("homedir(")
-        )
-      })
-      .map((entry) => entry.name)
-
-    expect(offenders).toEqual([])
-  })
-
-  test("the V2 entrypoint never imports the V1 entrypoint", () => {
-    const modules = fs
-      .readdirSync(v2)
-      .filter((name) => /\.(ts|tsx)$/.test(name))
-      .map((name) => ({ name, source: read(path.join(v2, name)) }))
-
-    const offenders = modules
-      .filter(({ name }) => name !== "tui.tsx")
-      .filter(({ source }) => source.includes('from "../tui"') || source.includes("from './../tui'"))
-      .map(({ name }) => name)
-    expect(offenders).toEqual([])
-  })
-
   test("the V1 entrypoint and package manifest are byte-identical", () => {
     for (const [file, expected] of Object.entries(V1_HASHES)) {
       expect(sha256(path.join(root, file)), `${file} changed`).toBe(expected)
     }
     const rootPackage = JSON.parse(read(path.join(root, "package.json")))
     expect(rootPackage.exports["./tui"]).toBe("./tui.ts")
-    expect(read(path.join(root, "tui.ts"))).toContain("keymap.registerLayer")
   })
 })

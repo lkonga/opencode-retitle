@@ -129,12 +129,33 @@ export function createRetitleAdapter(context: RetitleContext, options: AdapterOp
 
     async resolveModel(sessionID, messages, override) {
       await ensureCatalog(catalog())
-      return resolveTitleModel({
+      const resolution = resolveTitleModel({
         override,
         source: catalog(),
         sessionModel: sessionRefFor(sessionID),
         messages,
       })
+      // Metadata only: which model, which chain step produced it, and how many
+      // preferences were stale. Never the prompt, the transcript or the title.
+      logger.event("model-selected", {
+        sessionID,
+        providerID: resolution.model.providerID,
+        modelID: resolution.model.modelID,
+        modelSource: resolution.source,
+        hasOverride: Boolean(override),
+        skippedModelCount: resolution.skipped.length,
+      })
+      const staleTitleAgent = resolution.skipped.find((item) => item.source === "title-agent")
+      if (staleTitleAgent) {
+        // An inherited `agents.title.model` that this runtime cannot serve: the
+        // chain continued, so this is a diagnostic, not a failure.
+        logger.event("title-agent-model-unavailable", {
+          sessionID,
+          providerID: staleTitleAgent.model.providerID,
+          modelID: staleTitleAgent.model.modelID,
+        })
+      }
+      return resolution.model
     },
 
     generateTitle({ prompt, model }) {

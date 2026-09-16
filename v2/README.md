@@ -19,7 +19,7 @@ the current session's title from a bounded sample of its conversation, on demand
 | File | Purpose |
 |---|---|
 | `tui.tsx` | V2 TUI entrypoint. One `app` slot claim, one keymap layer. No logic. |
-| `command.ts` | The single `/retitle` command (palette + slash in one registration) and the `mode: "global"` layer factory. |
+| `command.ts` | The single `/retitle` command (palette + slash + the fixed `ctrl+shift+r` binding in one registration) and the `mode: "global"` layer factory. |
 | `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply. |
 | `runner.ts` | Pure pipeline over injected ports: sample → model → native generation → clean title. |
 | `adapter.ts` | The only module that knows `Plugin.Context`; wires context → ports, settings, gate, logger. |
@@ -42,8 +42,9 @@ the current session's title from a bounded sample of its conversation, on demand
    is dropped silently. The gate is released in `finally`.
 3. Read **one bounded page** of history (200 messages, newest-first, reversed
    locally) and sample with V1's tail-3 + spread algorithm.
-4. Resolve the title model (below) and fail fast if a configured model is not in
-   the loaded catalogue.
+4. Resolve the title model (below). A settings override is fail-fast if the
+   loaded catalogue does not carry it; a stale `agents.title.model` is skipped
+   and the chain continues.
 5. Create a short-lived helper session pinned to the `title` agent and the
    resolved model, call the native `session.generate` under a 45 s deadline, and
    remove the helper in `finally` (separate 5 s deadline, failures are logged and
@@ -70,7 +71,51 @@ dialog options can also be seeded from the command line:
 | `--from P` | 100 | 0–100 | percentage-based sampling centre (100 = end) |
 | `--offset N` | all | ≥1 | use only the last N messages (user + assistant) |
 
-Remaining text after the flags is the steering hint.
+Remaining text after the flags is the steering hint. The ranges are clamped, not
+rejected: `--samples` is clamped to `3..50`, `--from` to `0..100` and `--offset`
+to `>=1`. (`--offset 0` is therefore out of range and becomes `1`; the dialog's
+`Offset: 0` entry means "all messages" and simply omits the flag.)
+
+### Keybind
+
+The command carries a raw, **fixed** binding in addition to its palette and
+slash reachability:
+
+| Stroke | Command id | Remappable? |
+|---|---|---|
+| `ctrl+shift+r` | `retitle.session.retitle` | no — ships with the plugin |
+
+Why a raw binding:
+
+* A reachable V2 command carries its own key stroke. The single command object
+  therefore has an `id`, `palette`, `slash` *and* `bind`; the layer builder turns
+  that into one reachable command plus one binding for it
+  (`packages/tui/src/context/keymap.tsx`, `createLayer`).
+* The stroke was checked against all 218 TUI defaults in
+  `packages/tui/src/config/keybind.ts` (pinned source `c5f4ce3d66`): no default
+  uses `ctrl+shift+r`. The nearest neighbours are `session.rename` (`ctrl+r`),
+  `session.tab.reopen` (`ctrl+shift+t`) and `input.delete.line`
+  (`ctrl+shift+d`); the only `mod+shift+r` in the tree is `review.toggle` in
+  `packages/app`, a different (non-TUI) surface.
+* It was also checked against the live `keybinds` block of the V2
+  `<config>/cli.json`, which contains no `ctrl+shift+r` override. That same
+  `plugins` array must list this plugin at most once — a second entry for the
+  same directory would activate the keymap layer twice.
+* It assumes the terminal reports modified strokes, which the runtime already
+  requires for its own `ctrl+shift+t` (`session.tab.reopen`), `ctrl+shift+d`
+  (`input.delete.line`) and `ctrl+shift+a/e` defaults. A terminal that folds
+  `ctrl+shift+r` into `ctrl+r` simply never fires this stroke; `/retitle` stays
+  reachable from the slash menu and the palette.
+
+Why it is deliberately **not** a config keybind: `TuiKeybind.parse` rejects any
+key it does not know (`packages/tui/src/config/keybind.ts`), and the plugin does
+not add a `Definitions` entry to the canonical table. Adding
+`retitle.session.retitle` to `cli.json`'s `keybinds` is therefore a fatal
+"Unrecognized keybind" error rather than a remap. This is intentional: the
+plugin's key does not require (and must not require) a change to the canonical
+config, and it cannot be remapped without editing `command.ts`. `/retitle`
+remains usable from the slash menu and the palette either way; the stroke is
+only added convenience, and it is the plugin's only keybind.
 
 ### Title model resolution
 
@@ -81,9 +126,28 @@ Remaining text after the flags is the steering hint.
 4. the first assistant message's model
 5. the first enabled, non-deprecated catalogue model
 
-A configured override is never silently replaced: if the catalogue is loaded and
-does not contain it, the run fails with `Model from settings is not available in
-this runtime: provider/model`.
+Nothing is hardcoded, and the two kinds of configuration fail differently on
+purpose:
+
+* **The explicit override is strict and fail-closed.** If the catalogue is loaded
+  and does not contain it, the run fails with `Model from settings is not
+  available in this runtime: provider/model` rather than quietly generating with
+  a different model.
+* **The `title` agent's model is a preference, not a choice made for this run.**
+  It is used only when the loaded catalogue carries it. A stale value — the live
+  case is an inherited V1 `agents.title.model` naming a provider this runtime no
+  longer has — is skipped, and the chain continues to the session model, the
+  assistant model, or the first enabled catalogue model. The chosen fallback is
+  what gets pinned to the fresh `title`-agent helper session.
+* **An empty catalogue is a read failure, not a verdict.** When no catalogue
+  could be read, nothing can be confirmed, so the preference chain is used
+  unvalidated (the strict override rule still applies as written above).
+
+The log records the outcome as metadata only: `model-selected` with the model
+ids, the chain step that produced them (`settings-override`, `title-agent`,
+`session`, `assistant-message`, `catalog`) and the number of stale preferences,
+plus a `title-agent-model-unavailable` event naming the stale ref. No prompt,
+transcript or generated title is ever logged.
 
 ## Registration (V2 has no `tui.json`)
 
@@ -113,7 +177,8 @@ Pinned source: `/home/lkonga/codes/opencode-v2-scrollfix` (`c5f4ce3d66`).
 | Plugin context | `Plugin.Context` | `packages/plugin/src/tui/context.ts:466-481` |
 | Mount | `context.ui.slot({ append: "app", render })` | `packages/plugin/src/tui/context.ts:463`, `packages/tui/src/plugin/api.tsx:201-215` |
 | Commands | `context.keymap.layer(() => KeymapLayer)` | `packages/tui/src/plugin/api.tsx:135-143`, `packages/tui/src/context/keymap.tsx:187-262` |
-| Command shape | `{ id, title, description, group, palette, slash, run }` | `packages/plugin/src/tui/context.ts:354-380` |
+| Command shape | `{ id, title, description, group, bind, palette, slash, run }` | `packages/plugin/src/tui/context.ts:354-380` |
+| Keybind | `bind` on the named command → one binding for its id | `packages/tui/src/context/keymap.tsx:187-262` |
 | Slash args | `slash: { name: "retitle", arguments: true }` → `run(rawInput)` | `packages/tui/src/component/prompt/autocomplete.tsx:513-519`, `packages/tui/src/component/prompt/index.tsx:178-188,1115-1122` |
 | Dialogs | `context.ui.dialog.select/prompt` | `packages/plugin/src/tui/context.ts:341-352`, `packages/tui/src/plugin/api.tsx:287-306` |
 | Toasts | `context.ui.toast.show(...)` | `packages/plugin/src/tui/context.ts:244-253` |
@@ -139,10 +204,11 @@ prompt pushes the `autocomplete` mode whenever the slash menu is open
 would therefore vanish exactly when `/retitle` needs to be offered. A global
 layer registers with no mode field and matches every mode.
 
-No keybind is invented: the command carries an `id` plus `palette`/`slash` and no
-`bind`, matching the proven `opencode-pool-guard/v2` port. Unknown keybind ids in
-`cli.json` are fatal (`packages/tui/src/config/keybind.ts`), so adding a binding
-would require changing the canonical config.
+No keybind is read from `cli.json`: the command's stroke is the fixed
+`ctrl+shift+r` declared in `command.ts` and described under [Keybind](#keybind).
+Because the runtime's keybind schema rejects unknown ids
+(`packages/tui/src/config/keybind.ts`), adding `retitle.session.retitle` to the
+config's `keybinds` is fatal rather than a remap — do not add one.
 
 ## Intentional differences from V1
 
@@ -152,8 +218,10 @@ would require changing the canonical config.
 | Generation | `session.prompt` on a child session, then poll `session.messages` every 500 ms (24 attempts) | `session.generate` returns the text directly | no polling ⇒ no late/duplicate observations, and a hard deadline instead of a poll budget |
 | Helper session | child of the current session (`parentID`) | short-lived top-level session, removed in `finally` | the public `session.create` payload has no `parentID` |
 | Settings storage | `retitle-config.json` in `$OPENCODE_CONFIG_DIR || ~/.config/opencode` | host plugin storage (`context.storage`) | channel-scoped durable state; **no code path can reach the V1 config directory** |
+| Model resolution | any unavailable pick was fatal (`Provider not available` / `Model not available`) | the explicit override is still fatal, but a stale `title` agent model is skipped and the chain continues | an inherited `agents.title.model` for a provider this runtime no longer has must not disable `/retitle`; the user's own choice stays fail-closed, and no model is ever hardcoded |
 | Failure feedback | V1 logged `{key, message}` where the key embedded the error text | events and sizes only; errors become `{errorName, errorLength}` | never log provider text that may echo the transcript |
 | `--samples/--offset/--from` | dialog only | dialog **and** the prompt line (`slash.arguments`) | the flags were documented but unreachable from the prompt |
+| Keybind | none (palette/slash only) | fixed `ctrl+shift+r` on the same single command, not a config keybind | one reachable command that also owns a key stroke; adding a config keybind id for the plugin would be fatal (`Unrecognized keybind`), so the stroke is deliberately fixed and non-remappable (see [Keybind](#keybind)) |
 | Busy modal | blocking dialog while generating | toasts + the run gate | the V2 dialog API is promise-based; a modal would have to be re-implemented |
 
 ## Tests
@@ -170,14 +238,23 @@ Coverage highlights:
 * `runner.test.ts` — empty / single-turn / 400-turn histories, `--offset`
   windowing, provider failure, deadline, model failure, refusal output, title
   cleaning, title write.
-* `command-flow.test.ts` — one palette+slash registration, raw-arg delivery,
-  concurrent invocation rejected, debounce window, Apply/Edit/Cancel/Regenerate,
-  empty session, provider failure reopening settings, model persistence, gate
-  release on a throwing dialog.
+* `command-flow.test.ts` — one palette+slash registration, the fixed binding and
+  its single-stroke uniqueness, raw-arg delivery, the bounded prompt going to the
+  helper session only, the fallback model reaching a fresh `title`-agent helper
+  when the configured title model is stale, concurrent invocation rejected,
+  debounce window, Apply/Edit/Cancel/Regenerate, empty session, provider failure
+  reopening settings, model persistence, gate release on a throwing dialog.
 * `adapter.test.ts` — durable settings round trip, store fallback with bounded
-  slice, catalogue degradation, model resolution order and validation, toast
-  debounce.
-* `gate.test.ts`, `logger.test.ts`, `tui-contract.test.ts` — run gate semantics,
-  log redaction, and the public-boundary / V1-byte-identity guards.
+  slice, catalogue degradation, the full model chain (a stale `title` agent model
+  skipped to the session, assistant and catalogue steps; the strict override
+  failure retained; the unloaded-catalogue exception), model-source logging
+  metadata, toast debounce.
+* `gate.test.ts`, `logger.test.ts` — run gate semantics and log redaction,
+  including that the log path ignores the V1 config environment.
+* `tui-contract.test.ts` — artifact-level guards: the resolved `./tui`
+  entrypoint, the parsed V2 module graph (the runtime specifier is the only bare
+  import, no module imports the V1 entrypoint, only `logger.ts` may open a file),
+  and the byte-identical V1 files. Imports are read with `Bun.Transpiler.scan`,
+  not by matching source text.
 
 Runtime smokes on the V2 binary are recorded on issue #239.

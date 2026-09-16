@@ -3,7 +3,13 @@
 
 import { describe, expect, test } from "bun:test"
 import { createRetitleAdapter } from "../adapter"
-import { RETITLE_COMMAND_ID, RETITLE_SLASH_NAME, createRetitleCommand, retitleKeymapLayer } from "../command"
+import {
+  RETITLE_BIND,
+  RETITLE_COMMAND_ID,
+  RETITLE_SLASH_NAME,
+  createRetitleCommand,
+  retitleKeymapLayer,
+} from "../command"
 import { openRetitle } from "../dialogs"
 import { fakeCatalog, fakeClient, fakeContext, fakeUi, fakeUiAtHome, userMessage } from "./fake"
 import type { SessionApiClient } from "../session-api"
@@ -44,6 +50,37 @@ describe("command registration", () => {
     expect(command.id).toBe(RETITLE_COMMAND_ID)
     expect(command.palette).toBe(true)
     expect(command.slash).toEqual({ name: RETITLE_SLASH_NAME, arguments: true })
+  })
+
+  test("carries a raw binding alongside the palette and slash reachability", () => {
+    const layer = retitleKeymapLayer(() => {})
+
+    // The runtime's layer builder validates the entry shape: an entry with an
+    // `id`, `palette` and `slash` is a *named* command, while an entry without
+    // an `id` may only carry `bind` ("Inline keymap commands require bind",
+    // "Palette commands require an ID"). Both together are what makes this one
+    // reachable command that also owns a key stroke, not an inline shortcut.
+    expect(layer.commands).toHaveLength(1)
+    const [command] = layer.commands
+    expect(typeof command.id).toBe("string")
+    expect(command.palette).toBe(true)
+    expect(command.slash).toBeDefined()
+    expect(typeof command.bind).toBe("string")
+    expect(command.bind).toBe(RETITLE_BIND)
+  })
+
+  test("binds one fixed stroke that no other command in the layer claims", () => {
+    const layer = retitleKeymapLayer(() => {})
+    const strokes = layer.commands.flatMap((command) =>
+      typeof command.bind === "string" ? command.bind.split(",").map((stroke) => stroke.trim()) : [],
+    )
+
+    // A single stroke: the command fires on its own key, not on a sequence it
+    // shares with another command.
+    expect(RETITLE_BIND).toBe("ctrl+shift+r")
+    expect(RETITLE_BIND.includes(",")).toBe(false)
+    expect(strokes).toEqual([RETITLE_BIND])
+    expect(new Set(strokes).size).toBe(strokes.length)
   })
 
   test("delivers the raw argument string to the handler exactly once per invocation", async () => {
@@ -98,6 +135,89 @@ describe("run lifecycle", () => {
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
     expect(ui.toasts.some((toast) => toast.message === "New title: Generated title")).toBe(true)
     expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("sends the bounded sampled prompt to the helper session only", async () => {
+    // A 400-turn history with very long turns: the prompt must be the sampled
+    // subset, and it must never be sent to the session being retitled. The
+    // client returns the page newest-first (`order: "desc"`), exactly as the
+    // runtime does.
+    const oldestFirst: Array<unknown> = []
+    for (let index = 0; index < 400; index++) {
+      oldestFirst.push({ type: "user", text: `turn ${index} ${"x".repeat(500)}` })
+      oldestFirst.push({ type: "assistant", content: [{ type: "text", text: `answer ${index}` }] })
+    }
+    const page = [...oldestFirst].reverse()
+    const ui = fakeUi({ select: ["run", "cancel"] })
+    const client = fakeClient({ list: () => ({ data: page, cursor: {} }) })
+    const { adapter } = setup({ ui, client, messages: oldestFirst })
+
+    await openRetitle(ui, adapter, "--samples 5")
+
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.generates).toHaveLength(1)
+    const [generation] = client.calls.generates
+    expect(generation.sessionID).toBe("ses_helper")
+    expect(generation.sessionID).not.toBe("ses_current")
+    // The current session is only ever read (message.list) and, on Apply,
+    // written (session.rename) — never prompted.
+    expect(client.calls.lists.map((call) => call.sessionID)).toEqual(["ses_current"])
+    expect(client.calls.renames).toEqual([])
+    expect(generation.prompt).toContain("turn 399")
+    expect(generation.prompt.split("[Turn ").length - 1).toBeLessThanOrEqual(10)
+    expect(generation.prompt.length).toBeLessThan(5_000)
+    expect(generation.prompt).not.toContain("x".repeat(500))
+    expect(client.calls.removes).toEqual(["ses_helper"])
+  })
+
+  test("gives the fresh helper the fallback model when the configured title model is stale", async () => {
+    // The live deployment shape: `agents.title.model` is inherited from V1 and
+    // points at a provider this runtime does not carry. The run must still work,
+    // with the fallback resolved by the chain, and the prompt must still go to a
+    // fresh helper session pinned to the `title` agent.
+    const logged: Array<{ name: string; fields: Record<string, unknown> }> = []
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const client = fakeClient({ list: () => ({ data: [userMessage("hello")], cursor: {} }) })
+    const context = fakeContext({
+      client: client.client,
+      catalog: fakeCatalog({
+        models: [{ id: "session-model", providerID: "session" }],
+        agents: [{ id: "title", model: { id: "9r-xai-grok-4.5-low", providerID: "9router" } }],
+      }),
+      sessionModel: { id: "session-model", providerID: "session" },
+      messages: [userMessage("hello")],
+    })
+    const adapter = createRetitleAdapter(context, {
+      logger: { event: (name, fields = {}) => void logged.push({ name, fields: fields as Record<string, unknown> }) },
+    })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.creates).toEqual([
+      {
+        title: "Retitle generation",
+        agent: "title",
+        model: { id: "session-model", providerID: "session" },
+        location: { directory: "/workspace/default" },
+      },
+    ])
+    expect(client.calls.generates).toHaveLength(1)
+    expect(client.calls.generates[0].sessionID).toBe("ses_helper")
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+
+    // The log explains the choice with metadata only — no transcript, prompt or title.
+    expect(logged.find((event) => event.name === "model-selected")?.fields).toMatchObject({
+      providerID: "session",
+      modelID: "session-model",
+      modelSource: "session",
+      skippedModelCount: 1,
+    })
+    expect(logged.find((event) => event.name === "title-agent-model-unavailable")?.fields).toMatchObject({
+      providerID: "9router",
+      modelID: "9r-xai-grok-4.5-low",
+    })
+    expect(JSON.stringify(logged)).not.toContain("hello")
+    expect(JSON.stringify(logged)).not.toContain("Generated title")
   })
 
   test("applies an edited title instead of the generated one", async () => {

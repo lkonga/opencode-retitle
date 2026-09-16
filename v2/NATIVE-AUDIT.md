@@ -132,6 +132,50 @@ The plugin therefore:
 | Trigger | first successful prompt step | explicit command (slash or palette) |
 | Scope | root sessions only; only while still exactly untitled | any session, any number of times |
 | History | first user message only | bounded page (200 messages), tail-3 + spread sampling |
-| Model | `title` agent model, else the session model | settings override → `title` agent model → session model → last assistant model → first catalogue model |
+| Model | `title` agent model, else the session model (a stale agent model is used, and fails at request time) | settings override (strict) → `title` agent model **only when the loaded catalogue carries it** → session model → first assistant model → first catalogue model |
 | Write | `SessionEvent.Renamed` (100-char cap, CAS on bus sequence) | `session.rename` after explicit Apply/Edit |
 | Config | `agents.title.model` (`small_model` migrated at `packages/core/src/config/normalize.ts:123-140`) | own durable plugin state; `small_model` equivalent still read from the title agent |
+
+## 6. Verification against the installed runtime (2026-09-16)
+
+Read live from the running instance (`opencode-v2 serve --service`, port 49375)
+rather than from source: `GET /openapi.json`, then `GET /api/agent`,
+`GET /api/model` and `GET /api/provider`, cross-checked against the V2 config
+file (`<config>/opencode.jsonc`) and the live `cli.json`. The point of this
+section is that every public surface `/retitle` uses was checked against the
+binary that actually serves it.
+
+| Check | Result |
+|---|---|
+| `session.generate` | `POST /api/session/{sessionID}/generate`, body `{ prompt }` only (the session is the path parameter), response `{ data: { text } }`. The plugin's `{ sessionID, prompt }` client call and its `text` / `data.text` reader both match. |
+| `session.rename` / `session.remove` | `PATCH` and `DELETE` on `/api/session/{sessionID}`, operation ids `session.rename` / `session.remove`. There is no `/rename` path in the installed spec — the divergence in §4 is real and is exactly why the plugin never builds a request. |
+| `session.create` | Body `{ id?, title?, agent?, model?, location? }`; `model` is `Model.Ref { id, providerID, variant? }`, `location` is `Location.PublicRef { directory }`. The plugin sends exactly `{ title, agent, model, location }`. Excess properties are tolerated, not rejected — a bogus query parameter on `agent.list` still returns 200 — so a location that also carries `workspaceID` cannot break the helper create. |
+| `message.list` | Accepts `limit`, `order` (`asc`/`desc`), `cursor` and a `type` filter. `/retitle` sends one page, `limit=200&order=desc`, and never follows `cursor`. |
+| `Agent.Info.model` | `Model.Ref` (`id`, `providerID`, optional `variant`), optional on the agent. The live `agent.list` returns 68 agents including the hidden `title` agent, whose model is the configured `agents.title.model`. This is the value `models.ts` reads, prefers when the loaded catalogue carries it, and otherwise skips down the chain — there is no hardcoded model anywhere in the plugin. |
+| `Model.Info.id` vs `modelID` | `Model.Info` carries both and they are **not** interchangeable: 8 of 224 live entries differ (`om-dsv4f`/`dsv4f`, `*-fast`). Refs (`Model.Ref`, `session.create`, `session.switchModel`) match on `id`, which is what the plugin's resolver, catalogue match and model picker all use. Normalizing to `modelID` would break those entries. |
+| Native duplicate | The installed binary contains no `retitle` string at all, and the pinned source has no routable title endpoint: there is no native command, route or palette entry for `/retitle` to collide with. |
+| Keybind conflicts | `ctrl+shift+r` appears in none of the 218 TUI defaults (`packages/tui/src/config/keybind.ts` @ `c5f4ce3d66`) and in no `keybinds` override of the live `cli.json`. The single `mod+shift+r` in the tree is `review.toggle` in `packages/app`, a separate non-TUI surface. |
+
+### Deployment note (config parity vs. plugin usability)
+
+On this host the live config sets `agents.title.model` to
+`9router/9r-xai-grok-4.5-low` (inherited from V1), while the running instance
+advertises providers `github-copilot`, `merge-gateway`, `deepseek`,
+`codex-omniroute`, `omniroute` and lists no `9router` model.
+
+`/retitle` treats that as a stale *preference*: the title agent's model is
+skipped (logged as `title-agent-model-unavailable` with the ref, metadata only),
+the chain continues to the session model / assistant model / first catalogue
+model, and the chosen fallback is pinned to the fresh `title`-agent helper. An
+explicit **settings** override for an unavailable model still fails closed, and
+nothing is hardcoded, so the plugin stays usable without touching the canonical
+title config or its parity.
+
+The native auto-titler is not affected by this decision and keeps using
+`agent.model ?? session model` (`packages/core/src/session/title.ts:65-69`), so a
+stale `agents.title.model` still degrades automatic titling — fixing the config
+is worthwhile for that reason, not for `/retitle`.
+
+The plugin is also not currently listed in the live `cli.json` `plugins` array,
+so the V2 TUI does not load it yet. Registration there is one entry, never two
+(listing the same directory twice would register the keymap layer twice).

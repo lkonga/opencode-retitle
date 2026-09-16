@@ -182,6 +182,32 @@ describe("generateTitleText", () => {
     expect(text()).toContain("generate-truncated")
   })
 
+  test("enforces a hard timeout on helper creation", async () => {
+    const { client, calls } = fakeClient({ create: () => never() })
+    const { logger, events } = captureLogger()
+
+    await expect(generateTitleText({ client, ...input, logger, helperTimeoutMs: 20 })).rejects.toMatchObject({
+      code: "helper-create",
+    })
+
+    expect(events.some((event) => event.name === "helper-create-error")).toBe(true)
+    expect(events.some((event) => event.fields.timedOut === true)).toBe(true)
+    // Nothing was created, so there is nothing to clean up and no prompt was sent.
+    expect(calls.generates).toEqual([])
+    expect(calls.removes).toEqual([])
+  })
+
+  test("a hanging cleanup cannot hang the run", async () => {
+    const { client, calls } = fakeClient({ remove: () => never() })
+    const { logger, events } = captureLogger()
+
+    expect(await generateTitleText({ client, ...input, logger, cleanupTimeoutMs: 20 })).toBe("Generated title")
+
+    expect(calls.removes).toEqual(["ses_helper"])
+    const failed = events.find((event) => event.name === "helper-remove-error")
+    expect(failed?.fields.timedOut).toBe(true)
+  })
+
   test("fails fast instead of polling when the runtime has no native generation", async () => {
     const { client, calls } = fakeClient({ withoutGenerate: true })
     const { logger, events } = captureLogger()

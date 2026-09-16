@@ -324,49 +324,73 @@ export function formatModelLabel(model: ModelRef | undefined, override?: string)
   return "(auto)"
 }
 
+/**
+ * Which step of the resolution chain produced the model. This is metadata for
+ * the log — never conversation content, never the prompt or the title.
+ */
+export type ModelSource = "settings-override" | "title-agent" | "session" | "assistant-message" | "catalog"
+
 export type ModelCandidates = {
   /** Persisted settings override, `provider/model`. Highest priority. */
   readonly override?: string
   /** V2 equivalent of V1 `small_model`: the built-in `title` agent's model. */
-  readonly agentModel?: { readonly providerID?: string; readonly id?: string; readonly variant?: string } | null
+  readonly agentModel?: ModelRef | null
   /** The session's currently selected model. */
-  readonly sessionModel?: { readonly providerID?: string; readonly id?: string; readonly variant?: string } | null
-  readonly messages?: ReadonlyArray<RetitleMessage>
+  readonly sessionModel?: ModelRef | null
+  /** First model seen on an assistant message in the sampled history. */
+  readonly assistantModel?: ModelRef | null
   /** Catalog fallback list (`data.location.model.list()`). */
   readonly available?: ReadonlyArray<AvailableModel>
+  /**
+   * Acceptance test for the *preference* candidates (everything except the
+   * catalogue fallback). When omitted every candidate is accepted, which is the
+   * correct behaviour when no catalogue could be read: an unreadable catalogue
+   * is a read failure, not a verdict on a model.
+   */
+  readonly usable?: (model: ModelRef) => boolean
 }
 
-function refFrom(value: { providerID?: string; id?: string; variant?: string } | null | undefined): ModelRef | undefined {
-  if (!value) return undefined
-  const providerID = text(value.providerID)
-  const modelID = text(value.id)
-  if (!providerID || !modelID) return undefined
-  return { providerID, modelID, ...(text(value.variant) ? { variant: value.variant } : {}) }
+export type PickedModel = {
+  readonly model: ModelRef
+  readonly source: ModelSource
+}
+
+/** First model seen on an assistant message (V1 `pickSessionModel` parity). */
+export function assistantMessageModel(messages?: ReadonlyArray<RetitleMessage>): ModelRef | undefined {
+  for (const message of messages ?? []) {
+    if (message.role === "assistant" && message.model) return message.model
+  }
+  return undefined
 }
 
 /**
  * Resolution order, mirroring V1 (`pickSessionModel`):
  * settings override -> title agent model (V1 `small_model`) -> session model ->
  * first assistant message model -> first enabled, non-deprecated catalog model.
+ *
+ * `usable` is applied to each *preference* candidate, so a caller that knows the
+ * loaded catalogue can drop a stale preference and let the chain continue to the
+ * next step. The catalogue fallback is the end of the chain and needs no test.
  */
-export function pickModel(candidates: ModelCandidates): ModelRef | undefined {
+export function pickModel(candidates: ModelCandidates): PickedModel | undefined {
+  const usable = candidates.usable ?? (() => true)
+
   const override = candidates.override ? parseModelString(candidates.override) : undefined
-  if (override) return override
+  if (override && usable(override)) return { model: override, source: "settings-override" }
 
-  const agent = refFrom(candidates.agentModel)
-  if (agent) return agent
+  const agent = candidates.agentModel ?? undefined
+  if (agent && usable(agent)) return { model: agent, source: "title-agent" }
 
-  const session = refFrom(candidates.sessionModel)
-  if (session) return session
+  const session = candidates.sessionModel ?? undefined
+  if (session && usable(session)) return { model: session, source: "session" }
 
-  for (const message of candidates.messages ?? []) {
-    if (message.role === "assistant" && message.model) return message.model
-  }
+  const assistant = candidates.assistantModel ?? undefined
+  if (assistant && usable(assistant)) return { model: assistant, source: "assistant-message" }
 
   for (const model of candidates.available ?? []) {
     if (model.enabled === false) continue
     if (model.status === "deprecated") continue
-    return { providerID: model.providerID, modelID: model.id }
+    return { model: { providerID: model.providerID, modelID: model.id }, source: "catalog" }
   }
   return undefined
 }
