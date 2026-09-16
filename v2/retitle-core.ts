@@ -6,6 +6,20 @@
 
 export const MAX_SAMPLE_TEXT_LENGTH = 200
 
+/**
+ * Upper bound applied to raw model output before it is cleaned. The installed
+ * runtime's title agent is capped at 50 characters by its system prompt, so a
+ * response past this bound is malformed (a runaway stream or an echoed
+ * transcript) rather than a title. Bounding here keeps a bad response from
+ * being carried around, logged, or re-rendered in a dialog.
+ */
+export const MAX_GENERATED_TEXT_LENGTH = 4096
+
+/** Sampling defaults, mirroring the V1 dialog defaults (`../tui.ts`). */
+export const DEFAULT_SAMPLES = 10
+export const DEFAULT_OFFSET = 0
+export const DEFAULT_FROM_PCT = 100
+
 /** V2 `ModelRef` shape (`@opencode-ai/client`): the model id field is `id`. */
 export type ModelRef = {
   readonly providerID: string
@@ -310,24 +324,6 @@ export function formatModelLabel(model: ModelRef | undefined, override?: string)
   return "(auto)"
 }
 
-export function latestAssistantText(messages: ReadonlyArray<RetitleMessage>): string | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]
-    if (message.role !== "assistant") continue
-    if (message.text) return message.text
-  }
-  return undefined
-}
-
-export function latestAssistantError(messages: ReadonlyArray<RetitleMessage>): string | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]
-    if (message.role !== "assistant") continue
-    if (message.error) return message.error
-  }
-  return undefined
-}
-
 export type ModelCandidates = {
   /** Persisted settings override, `provider/model`. Highest priority. */
   readonly override?: string
@@ -422,4 +418,58 @@ export function buildModelOptions(
 
 export function isRefusal(value: string): boolean {
   return /\b(cannot|can't|can not|won't|unable)\s+(assist|help|fulfill|complete)/i.test(value)
+}
+
+// ─── Public API result normalization ─────────────────────────────────────────
+//
+// The plugin never builds a wire request: it calls public client methods and
+// reads their results. The readers below are deliberately tolerant, because the
+// installed runtime binary and the pinned public source are different revisions
+// of the same generated client (see NATIVE-AUDIT.md). A shape drift must degrade
+// to "no title" — never to a partial apply, a thrown parse error, or an
+// unbounded value flowing into a dialog or a log line.
+
+/** Reads a bounded assistant text out of `client.session.generate`'s result. */
+export function normalizeGeneratedText(value: unknown): string | undefined {
+  const text = generatedText(value)
+  if (text === undefined) return undefined
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+  return trimmed.length > MAX_GENERATED_TEXT_LENGTH ? trimmed.slice(0, MAX_GENERATED_TEXT_LENGTH) : trimmed
+}
+
+function generatedText(value: unknown): string | undefined {
+  if (typeof value === "string") return value
+  if (!value || typeof value !== "object") return undefined
+  const record = value as { readonly text?: unknown; readonly data?: unknown }
+  if (typeof record.text === "string") return record.text
+  const data = record.data
+  if (data && typeof data === "object" && typeof (data as { readonly text?: unknown }).text === "string") {
+    return (data as { readonly text: string }).text
+  }
+  return undefined
+}
+
+/** Reads the message page out of `client.message.list`'s result. */
+export function normalizeMessagePage(value: unknown): RawSessionMessage[] {
+  if (Array.isArray(value)) return value as RawSessionMessage[]
+  if (value && typeof value === "object") {
+    const data = (value as { readonly data?: unknown }).data
+    if (Array.isArray(data)) return data as RawSessionMessage[]
+  }
+  return []
+}
+
+/** Reads the created helper session id out of `client.session.create`'s result. */
+export function normalizeCreatedSessionID(value: unknown): string | undefined {
+  if (typeof value === "string") return value || undefined
+  if (!value || typeof value !== "object") return undefined
+  const record = value as { readonly id?: unknown; readonly data?: unknown }
+  if (typeof record.id === "string" && record.id) return record.id
+  const data = record.data
+  if (data && typeof data === "object") {
+    const nested = (data as { readonly id?: unknown }).id
+    if (typeof nested === "string" && nested) return nested
+  }
+  return undefined
 }

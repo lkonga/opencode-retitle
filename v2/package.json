@@ -5,7 +5,16 @@
   "exports": {
     "./tui": "./tui.tsx",
     "./core": "./retitle-core.ts",
-    "./config": "./config.ts"
+    "./command": "./command.ts",
+    "./settings": "./settings.ts",
+    "./logger": "./logger.ts",
+    "./deadline": "./deadline.ts",
+    "./gate": "./gate.ts",
+    "./session-api": "./session-api.ts",
+    "./models": "./models.ts",
+    "./adapter": "./adapter.ts",
+    "./runner": "./runner.ts",
+    "./dialogs": "./dialogs.ts"
   },
   "scripts": {
     "test": "bun test"

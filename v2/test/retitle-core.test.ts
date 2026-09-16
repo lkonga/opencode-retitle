@@ -3,9 +3,11 @@ import {
   buildModelOptions,
   cleanTitle,
   isModelAvailable,
-  latestAssistantError,
-  latestAssistantText,
+  MAX_GENERATED_TEXT_LENGTH,
   modelKey,
+  normalizeCreatedSessionID,
+  normalizeGeneratedText,
+  normalizeMessagePage,
   normalizeMessages,
   parseModelString,
   parseRetitleArgs,
@@ -208,11 +210,38 @@ describe("model helpers", () => {
   })
 })
 
-describe("latest message helpers", () => {
-  test("latestAssistantText and latestAssistantError read the newest assistant entry", () => {
-    const messages = [assistant("one"), user("q"), assistant("two")]
-    expect(latestAssistantText(messages)).toBe("two")
-    expect(latestAssistantError(messages)).toBeUndefined()
-    expect(latestAssistantError([assistant("x"), { role: "assistant", text: "", error: "kaput" }])).toBe("kaput")
+describe("public API result normalization", () => {
+  test("normalizeGeneratedText accepts the known envelopes and rejects the rest", () => {
+    expect(normalizeGeneratedText("bare")).toBe("bare")
+    expect(normalizeGeneratedText({ text: "unwrapped" })).toBe("unwrapped")
+    expect(normalizeGeneratedText({ data: { text: "wrapped" } })).toBe("wrapped")
+    expect(normalizeGeneratedText("  padded  ")).toBe("padded")
+
+    for (const value of [undefined, null, 42, {}, { text: 5 }, { data: {} }, { data: { text: 5 } }, "   ", []]) {
+      expect(normalizeGeneratedText(value)).toBeUndefined()
+    }
+  })
+
+  test("normalizeGeneratedText bounds an unbounded result", () => {
+    const result = normalizeGeneratedText("x".repeat(MAX_GENERATED_TEXT_LENGTH * 3))
+    expect(result?.length).toBe(MAX_GENERATED_TEXT_LENGTH)
+  })
+
+  test("normalizeMessagePage tolerates a page, a bare array, and garbage", () => {
+    const page = [{ type: "user", text: "hi" }]
+    expect(normalizeMessagePage({ data: page, cursor: {} })).toEqual(page)
+    expect(normalizeMessagePage(page)).toEqual(page)
+    expect(normalizeMessagePage(undefined)).toEqual([])
+    expect(normalizeMessagePage({ data: null })).toEqual([])
+    expect(normalizeMessagePage("nope")).toEqual([])
+  })
+
+  test("normalizeCreatedSessionID reads both envelopes and rejects malformed values", () => {
+    expect(normalizeCreatedSessionID({ id: "ses_1" })).toBe("ses_1")
+    expect(normalizeCreatedSessionID({ data: { id: "ses_2" } })).toBe("ses_2")
+    expect(normalizeCreatedSessionID("ses_3")).toBe("ses_3")
+    for (const value of [undefined, null, {}, { id: 5 }, { id: "" }, { data: { id: 7 } }, 42]) {
+      expect(normalizeCreatedSessionID(value)).toBeUndefined()
+    }
   })
 })
