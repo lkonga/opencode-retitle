@@ -7,6 +7,7 @@
 import type { SessionApiClient } from "../session-api"
 import type { SettingsStorage } from "../settings"
 import type { RetitleContext } from "../adapter"
+import type { ProgressSurface } from "../progress"
 import type { DialogApi, RetitleUiContext, SelectOption, ToastApi, ToastVariant } from "../dialogs"
 
 export type Recorded = {
@@ -14,6 +15,9 @@ export type Recorded = {
   readonly generates: Array<{ sessionID: string; prompt: string }>
   readonly removes: Array<string>
   readonly renames: Array<{ sessionID: string; title: string }>
+  readonly updates: Array<{ sessionID: string; title: string }>
+  readonly renameOptions: Array<{ readonly signal?: AbortSignal } | undefined>
+  readonly updateOptions: Array<{ readonly signal?: AbortSignal } | undefined>
   readonly lists: Array<{ sessionID: string; limit?: number; order?: "asc" | "desc" }>
 }
 
@@ -22,13 +26,27 @@ export type FakeClientOptions = {
   readonly generate?: (input: { sessionID: string; prompt: string }) => Promise<unknown> | unknown
   readonly remove?: (input: { sessionID: string }) => Promise<unknown> | unknown
   readonly rename?: (input: { sessionID: string; title: string }) => Promise<unknown> | unknown
+  readonly update?: (input: { sessionID: string; title: string }) => Promise<unknown> | unknown
   readonly list?: (input: { sessionID: string; limit?: number; order?: "asc" | "desc" }) => Promise<unknown> | unknown
   /** Omit `session.generate` entirely to simulate a runtime without it. */
   readonly withoutGenerate?: boolean
+  /** Omit `session.rename`: the live runtime's shape, where only `update` exists. */
+  readonly withoutRename?: boolean
+  /** Omit `session.update` to simulate the pinned source's shape. */
+  readonly withoutUpdate?: boolean
 }
 
 export function fakeClient(options: FakeClientOptions = {}) {
-  const calls: Recorded = { creates: [], generates: [], removes: [], renames: [], lists: [] }
+  const calls: Recorded = {
+    creates: [],
+    generates: [],
+    removes: [],
+    renames: [],
+    updates: [],
+    renameOptions: [],
+    updateOptions: [],
+    lists: [],
+  }
   const client = {
     session: {
       create: (input: Record<string, unknown>) => {
@@ -39,10 +57,24 @@ export function fakeClient(options: FakeClientOptions = {}) {
         calls.removes.push(input.sessionID)
         return Promise.resolve(options.remove ? options.remove(input) : undefined)
       },
-      rename: (input: { sessionID: string; title: string }) => {
-        calls.renames.push(input)
-        return Promise.resolve(options.rename ? options.rename(input) : undefined)
-      },
+      ...(options.withoutRename
+        ? {}
+        : {
+            rename: (input: { sessionID: string; title: string }, request?: { readonly signal?: AbortSignal }) => {
+              calls.renames.push(input)
+              calls.renameOptions.push(request)
+              return Promise.resolve(options.rename ? options.rename(input) : undefined)
+            },
+          }),
+      ...(options.withoutUpdate
+        ? {}
+        : {
+            update: (input: { sessionID: string; title: string }, request?: { readonly signal?: AbortSignal }) => {
+              calls.updates.push(input)
+              calls.updateOptions.push(request)
+              return Promise.resolve(options.update ? options.update(input) : undefined)
+            },
+          }),
       ...(options.withoutGenerate
         ? {}
         : {
@@ -127,21 +159,54 @@ export type FakeContextInput = {
   readonly storage?: SettingsStorage
   readonly messages?: Array<unknown>
   readonly sessionModel?: { id?: string; providerID?: string; variant?: string } | null
+  /**
+   * Shape of the reactive session refresh: `ok` (default), `reject` (the sync
+   * promise fails), `unsupported` (the runtime publishes neither method).
+   */
+  readonly refresh?: "ok" | "reject" | "unsupported"
+  /** Makes `data.session.invalidate` throw, to test refresh containment. */
+  readonly invalidateThrows?: boolean
 }
 
-export function fakeContext(input: FakeContextInput): RetitleContext & { readonly syncs: string[] } {
+export type FakeRetitleContext = RetitleContext & {
+  /** `data.session.message.sync` calls (history fallback). */
+  readonly syncs: string[]
+  /** `data.session.sync` calls (post-write reactive refresh). */
+  readonly refreshes: string[]
+  /** `data.session.invalidate` calls (post-write reactive refresh). */
+  readonly invalidations: string[]
+}
+
+export function fakeContext(input: FakeContextInput): FakeRetitleContext {
   const catalog = input.catalog ?? fakeCatalog()
   const syncs: string[] = []
+  const refreshes: string[] = []
+  const invalidations: string[] = []
   const messages = input.messages ?? []
+  const refresh = input.refresh ?? "ok"
   const location = Object.assign(catalog, {
     default: () => ({ directory: input.location?.directory ?? "/workspace/default" }),
   })
+  const refreshMethods =
+    refresh === "unsupported"
+      ? {}
+      : {
+          sync: (sessionID: string) => {
+            refreshes.push(sessionID)
+            return refresh === "reject" ? Promise.reject(new Error("refresh failed")) : Promise.resolve()
+          },
+          invalidate: (sessionID: string) => {
+            invalidations.push(sessionID)
+            if (input.invalidateThrows) throw new Error("invalidate failed")
+          },
+        }
   return {
     client: input.client,
     location: input.location,
     data: {
       location,
       session: {
+        ...refreshMethods,
         get: () => ({ model: input.sessionModel ?? null }),
         message: {
           list: () => messages,
@@ -154,7 +219,50 @@ export function fakeContext(input: FakeContextInput): RetitleContext & { readonl
     },
     storage: input.storage ?? fakeStorage().storage,
     syncs,
-  } as unknown as RetitleContext & { readonly syncs: string[] }
+    refreshes,
+    invalidations,
+  } as unknown as FakeRetitleContext
+}
+
+/** A `ProgressSurface` that records the messages it is asked to show and clear. */
+export type FakeProgress = {
+  readonly surface: ProgressSurface
+  readonly events: Array<{ readonly kind: "set" | "clear"; readonly message?: string }>
+  /** The message currently on screen, or undefined when nothing is shown. */
+  readonly active: () => string | undefined
+}
+
+export function fakeProgress(): FakeProgress {
+  const events: FakeProgress["events"] = []
+  let visible: string | undefined
+  return {
+    surface: {
+      set(message) {
+        events.push({ kind: "set", message })
+        visible = message
+      },
+      clear() {
+        events.push({ kind: "clear" })
+        visible = undefined
+      },
+    },
+    events,
+    active: () => visible,
+  }
+}
+
+/** A logger that records events, so diagnostics can be asserted as metadata. */
+export function recordingLogger() {
+  const events: Array<{ name: string; fields: Record<string, unknown> }> = []
+  return {
+    events,
+    logger: {
+      event: (name: string, fields: Record<string, unknown> = {}) => {
+        events.push({ name, fields })
+      },
+    },
+    text: () => JSON.stringify(events),
+  }
 }
 
 export type FakeUi = RetitleUiContext & {

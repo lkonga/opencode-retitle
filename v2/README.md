@@ -22,8 +22,9 @@ the current session's title from a bounded sample of its conversation, on demand
 | `command.ts` | The single `/retitle` command (palette + slash + the fixed `ctrl+shift+r` binding in one registration) and the `mode: "global"` layer factory. |
 | `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply. |
 | `runner.ts` | Pure pipeline over injected ports: sample → model → native generation → clean title. |
+| `progress.ts` | Run-scoped generation/apply progress: token-safe set/clear lifecycle over a public `{ set(message), clear() }` surface. |
 | `adapter.ts` | The only module that knows `Plugin.Context`; wires context → ports, settings, gate, logger. |
-| `session-api.ts` | Public client-method adapter: bounded history, helper lifecycle, native generation, rename. |
+| `session-api.ts` | Public client-method adapter: bounded history, helper lifecycle, native generation, title write (rename **or** update), post-write refresh. |
 | `models.ts` | Catalogue reads, title-model resolution and validation. |
 | `retitle-core.ts` | Pure logic: arg parsing, sampling, title prompt, cleaning, result normalization. |
 | `settings.ts` | Durable settings via the host's plugin storage (no config file, never the V1 config dir). |
@@ -51,7 +52,14 @@ the current session's title from a bounded sample of its conversation, on demand
    swallowed).
 6. Clean the result (think-tag stripping, quote removal, refusal detection,
    100-char cap) and offer Apply / Edit… / Regenerate / Cancel. Only Apply/Edit
-   writes the title, through the public `session.rename`.
+   writes the title, through `session.rename` when the runtime's generated client
+   exposes it and `session.update` otherwise (the live OC2 contract), then
+   refreshes the reactive session store (`data.session.invalidate` +
+   `sync`) so the new title is visible. See NATIVE-AUDIT §4.1/§4.2.
+7. Generation and the write each show a non-blocking progress surface
+   (`Generating title…` / `Applying title…`) through the public dialog lifecycle;
+   every path — cancel, deadline, failure, unexpected throw — clears it
+   (`progress.ts`, NATIVE-AUDIT §7).
 
 ### Flags
 
@@ -181,15 +189,17 @@ Pinned source: `/home/lkonga/codes/opencode-v2-scrollfix` (`c5f4ce3d66`).
 | Keybind | `bind` on the named command → one binding for its id | `packages/tui/src/context/keymap.tsx:187-262` |
 | Slash args | `slash: { name: "retitle", arguments: true }` → `run(rawInput)` | `packages/tui/src/component/prompt/autocomplete.tsx:513-519`, `packages/tui/src/component/prompt/index.tsx:178-188,1115-1122` |
 | Dialogs | `context.ui.dialog.select/prompt` | `packages/plugin/src/tui/context.ts:341-352`, `packages/tui/src/plugin/api.tsx:287-306` |
+| Progress | `context.ui.dialog.show(render)` / `context.ui.dialog.clear()` | `packages/plugin/src/tui/context.ts:343,347`, `packages/tui/src/plugin/api.tsx:234-243` |
 | Toasts | `context.ui.toast.show(...)` | `packages/plugin/src/tui/context.ts:244-253` |
 | Route | `context.ui.router.current()` | `packages/plugin/src/tui/context.ts:438-442` |
 | HTTP client | `context.client` | `packages/plugin/src/tui/context.ts:471` |
 | Durable state | `context.storage.store(key, { initial })` | `packages/plugin/src/tui/context.ts:34-39`, `packages/tui/src/context/storage.tsx:44-70` |
 | Reactive data | `context.data.location.{model,provider,agent}`, `context.data.session.{get,message}` | `packages/plugin/src/tui/context.ts:59-133` |
+| Title refresh | `context.data.session.invalidate(sessionID)` then `context.data.session.sync(sessionID)` | `packages/plugin/src/tui/context.ts:77-78` |
 | History | `client.message.list({ sessionID, limit, order })` | `packages/protocol/src/groups/message.ts:11-38` |
 | Generation | `client.session.generate({ sessionID, prompt })` | `packages/protocol/src/groups/session.ts:613-629`, `packages/client/src/promise/generated/client.ts:841-849` |
 | Helper | `client.session.create({ title, agent, model, location })` | `packages/server/src/handlers/session.ts:92-105`, `.../client.ts:465-480` |
-| Rename | `client.session.rename({ sessionID, title })` | `.../client.ts:576-587` |
+| Title write | `client.session.rename({ sessionID, title })`, else `client.session.update({ sessionID, title })` | `.../client.ts:576-587` (pinned source); live OC2 `PATCH /api/session/{sessionID}`, operation id `session.update` |
 | Cleanup | `client.session.remove({ sessionID })` | `.../client.ts:529-539` |
 
 ### Why the layer is `mode: "global"`
@@ -222,7 +232,7 @@ config's `keybinds` is fatal rather than a remap — do not add one.
 | Failure feedback | V1 logged `{key, message}` where the key embedded the error text | events and sizes only; errors become `{errorName, errorLength}` | never log provider text that may echo the transcript |
 | `--samples/--offset/--from` | dialog only | dialog **and** the prompt line (`slash.arguments`) | the flags were documented but unreachable from the prompt |
 | Keybind | none (palette/slash only) | fixed `ctrl+shift+r` on the same single command, not a config keybind | one reachable command that also owns a key stroke; adding a config keybind id for the plugin would be fatal (`Unrecognized keybind`), so the stroke is deliberately fixed and non-remappable (see [Keybind](#keybind)) |
-| Busy modal | blocking dialog while generating | toasts + the run gate | the V2 dialog API is promise-based; a modal would have to be re-implemented |
+| Busy modal | blocking dialog while generating | toasts + a non-blocking progress dialog + the run gate | the V2 dialog API is promise-based; a modal would have to be re-implemented |
 
 ## Tests
 
@@ -234,27 +244,36 @@ Coverage highlights:
 
 * `session-api.test.ts` — one bounded page, cursor never followed, tolerant
   envelopes, helper cleanup on success/failure/timeout, unbounded result bounds,
-  no-polling failure when the runtime lacks `session.generate`, rename wiring.
+  no-polling failure when the runtime lacks `session.generate`, the dual title
+  write (rename preferred, update fallback, no silent retry, AbortSignal on both,
+  no direct `fetch`), and the bounded best-effort reactive refresh.
+* `progress.test.ts` — the run-scoped progress lifecycle: idempotent clears, a
+  stale handle can never dismiss a newer surface, a run only clears what it owns,
+  a hostile/missing surface is contained, and `withProgress` clears on resolve,
+  rejection and synchronous throw.
 * `runner.test.ts` — empty / single-turn / 400-turn histories, `--offset`
   windowing, provider failure, deadline, model failure, refusal output, title
   cleaning, title write.
 * `command-flow.test.ts` — one palette+slash registration, the fixed binding and
   its single-stroke uniqueness, raw-arg delivery, the bounded prompt going to the
   helper session only, the fallback model reaching a fresh `title`-agent helper
-  when the configured title model is stale, concurrent invocation rejected,
-  debounce window, Apply/Edit/Cancel/Regenerate, empty session, provider failure
-  reopening settings, model persistence, gate release on a throwing dialog.
+  when the configured title model is stale, concurrent invocation rejected (and
+  it never clears the active run's progress), debounce window, Apply/Edit/Cancel/
+  Regenerate, empty session, provider failure reopening settings, model
+  persistence, gate release on a throwing dialog, generation/apply progress shown
+  and cleared on every outcome, and the post-write session refresh.
 * `adapter.test.ts` — durable settings round trip, store fallback with bounded
   slice, catalogue degradation, the full model chain (a stale `title` agent model
   skipped to the session, assistant and catalogue steps; the strict override
   failure retained; the unloaded-catalogue exception), model-source logging
-  metadata, toast debounce.
+  metadata, the write→refresh wiring (no refresh after a failed write, a failed
+  refresh never failing a written title), toast debounce.
 * `gate.test.ts`, `logger.test.ts` — run gate semantics and log redaction,
   including that the log path ignores the V1 config environment.
 * `tui-contract.test.ts` — artifact-level guards: the resolved `./tui`
   entrypoint, the parsed V2 module graph (the runtime specifier is the only bare
   import, no module imports the V1 entrypoint, only `logger.ts` may open a file),
-  and the byte-identical V1 files. Imports are read with `Bun.Transpiler.scan`,
-  not by matching source text.
+  no timer/listener/global in the progress path, and the byte-identical V1 files.
+  Imports are read with `Bun.Transpiler.scan`, not by matching source text.
 
 Runtime smokes on the V2 binary are recorded on issue #239.

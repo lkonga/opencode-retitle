@@ -12,6 +12,7 @@ import {
 import {
   loadSessionMessages,
   applySessionTitle,
+  refreshSessionTitle,
   generateTitleText,
   MESSAGE_PAGE_LIMIT,
   type LocationLike,
@@ -28,6 +29,7 @@ import {
 import { createSettingsStore, type SettingsStorage, type SettingsStore } from "./settings"
 import { createRunGate, createDebouncer, type RunGate } from "./gate"
 import { createRetitleLogger, type RetitleLogger } from "./logger"
+import { createProgressController, type ProgressController, type ProgressSurface } from "./progress"
 import type { RetitlePorts } from "./runner"
 
 export interface SessionInfoLike {
@@ -42,6 +44,9 @@ export interface RetitleContext {
     readonly location: CatalogSource & { default(): LocationLike }
     readonly session: {
       get(sessionID: string): SessionInfoLike | undefined
+      /** Reactive refresh of the session row itself (title lives here). */
+      sync?(sessionID: string): Promise<void>
+      invalidate?(sessionID: string): void
       readonly message: {
         list(sessionID: string): ReadonlyArray<RawSessionMessage>
         sync(sessionID: string): Promise<void>
@@ -72,6 +77,11 @@ export interface AdapterOptions {
   /** Failure-toast debounce window, ms. */
   readonly toastWindowMs?: number
   readonly now?: () => number
+  /**
+   * Public UI surface for generation/apply progress. The TUI entry binds it to
+   * `context.ui.dialog` (`show`/`clear`); without one, progress is a no-op.
+   */
+  readonly progressSurface?: ProgressSurface
 }
 
 export const DEFAULT_TOAST_WINDOW_MS = 15 * 60 * 1000
@@ -81,6 +91,8 @@ export interface RetitleAdapter {
   readonly settings: SettingsStore
   readonly logger: RetitleLogger
   readonly gate: RunGate
+  /** One progress controller per activation (see `progress.ts`). */
+  readonly progress: ProgressController
   /** True when this failure key should raise a toast (debounced). */
   readonly toastAllowed: (key: string) => boolean
   /** Public reactive catalogue used by the model picker and labels. */
@@ -92,6 +104,7 @@ export function createRetitleAdapter(context: RetitleContext, options: AdapterOp
   const gate = options.gate ?? createRunGate({ now: options.now })
   const now = options.now ?? (() => Date.now())
   const toastDebouncer = createDebouncer({ windowMs: options.toastWindowMs ?? DEFAULT_TOAST_WINDOW_MS, now })
+  const progress = createProgressController(options.progressSurface, logger)
 
   const logFailure = (error: unknown) => logger.event("adapter-read-error", { error })
 
@@ -172,8 +185,13 @@ export function createRetitleAdapter(context: RetitleContext, options: AdapterOp
       })
     },
 
-    applyTitle(sessionID, title) {
-      return applySessionTitle(context.client, sessionID, title, { logger })
+    async applyTitle(sessionID, title) {
+      // Write first: a failed write reports its own typed error. Only once the
+      // server accepted the title is the reactive store refreshed, and a refresh
+      // failure is contained inside `refreshSessionTitle` so a successful write
+      // can never be reported as a failed apply.
+      await applySessionTitle(context.client, sessionID, title, { logger })
+      await refreshSessionTitle(context.data?.session, sessionID, { logger })
     },
   }
 
@@ -182,6 +200,7 @@ export function createRetitleAdapter(context: RetitleContext, options: AdapterOp
     settings: createSettings(context, logger),
     logger,
     gate,
+    progress,
     toastAllowed: (key) => toastDebouncer.allow(key),
     catalog,
   }

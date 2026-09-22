@@ -10,8 +10,11 @@ import {
   createRetitleCommand,
   retitleKeymapLayer,
 } from "../command"
+import { RetitleTimeoutError } from "../deadline"
 import { openRetitle } from "../dialogs"
-import { fakeCatalog, fakeClient, fakeContext, fakeUi, fakeUiAtHome, userMessage } from "./fake"
+import { PROGRESS_APPLYING, PROGRESS_GENERATING } from "../progress"
+import type { RetitleLogger } from "../logger"
+import { fakeCatalog, fakeClient, fakeContext, fakeProgress, fakeUi, fakeUiAtHome, recordingLogger, userMessage } from "./fake"
 import type { SessionApiClient } from "../session-api"
 
 function deferred<T>() {
@@ -24,20 +27,32 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+/** Yields microtasks until `until()` holds (or the bound is hit). Deterministic: no timers. */
+async function drainUntil(until: () => boolean, limit = 100): Promise<void> {
+  for (let index = 0; index < limit && !until(); index++) await Promise.resolve()
+}
+
 function setup(options: {
   readonly ui: ReturnType<typeof fakeUi>
   readonly client?: ReturnType<typeof fakeClient>
   readonly messages?: Array<unknown>
   readonly catalog?: ReturnType<typeof fakeCatalog>
+  readonly refresh?: "ok" | "reject" | "unsupported"
+  readonly logger?: RetitleLogger
 }) {
   const client = options.client ?? fakeClient({ list: () => ({ data: options.messages ?? [userMessage("hello")], cursor: {} }) })
   const context = fakeContext({
     client: client.client,
     catalog: options.catalog ?? fakeCatalog({ models: [{ id: "gpt-5", providerID: "openai" }] }),
     messages: options.messages ?? [userMessage("hello")],
+    ...(options.refresh ? { refresh: options.refresh } : {}),
   })
-  const adapter = createRetitleAdapter(context, { logger: { event: () => {} } })
-  return { client, adapter, ui: options.ui }
+  const progress = fakeProgress()
+  const adapter = createRetitleAdapter(context, {
+    logger: options.logger ?? { event: () => {} },
+    progressSurface: progress.surface,
+  })
+  return { client, context, adapter, ui: options.ui, progress }
 }
 
 describe("command registration", () => {
@@ -386,5 +401,219 @@ describe("duplicate suppression", () => {
 
     expect(ui.selects).toHaveLength(4)
     expect(client.calls.creates).toHaveLength(2)
+  })
+})
+
+describe("progress feedback", () => {
+  test("shows generation then apply progress, clearing each in turn", async () => {
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const { adapter, progress } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(progress.events).toEqual([
+      { kind: "set", message: PROGRESS_GENERATING },
+      { kind: "clear" },
+      { kind: "set", message: PROGRESS_APPLYING },
+      { kind: "clear" },
+    ])
+    expect(progress.active()).toBeUndefined()
+    expect(PROGRESS_GENERATING).toBe("Generating title…")
+    expect(PROGRESS_APPLYING).toBe("Applying title…")
+  })
+
+  test("clears generation progress when the candidate is cancelled", async () => {
+    const ui = fakeUi({ select: ["run", "cancel"] })
+    const { adapter, progress } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(progress.events).toEqual([{ kind: "set", message: PROGRESS_GENERATING }, { kind: "clear" }])
+    expect(progress.active()).toBeUndefined()
+    expect(ui.toasts.some((toast) => toast.message.startsWith("New title"))).toBe(false)
+  })
+
+  test("clears generation progress on a generation timeout and still removes the helper", async () => {
+    const ui = fakeUi({ select: ["run", undefined] })
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => {
+        throw new RetitleTimeoutError(45_000, "generate")
+      },
+    })
+    const { adapter, progress } = setup({ ui, client })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(progress.active()).toBeUndefined()
+    expect(progress.events).toEqual([{ kind: "set", message: PROGRESS_GENERATING }, { kind: "clear" }])
+    expect(client.calls.removes).toEqual(["ses_helper"])
+    expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("clears generation progress on a provider failure and still removes the helper", async () => {
+    const ui = fakeUi({ select: ["run", undefined] })
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => {
+        throw new Error("provider 502")
+      },
+    })
+    const { adapter, progress } = setup({ ui, client })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(progress.active()).toBeUndefined()
+    expect(client.calls.removes).toEqual(["ses_helper"])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("clears apply progress when the write fails, with no refresh and no success toast", async () => {
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      rename: () => {
+        throw new Error("write refused")
+      },
+    })
+    const { adapter, progress, context } = setup({ ui, client })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(progress.events).toEqual([
+      { kind: "set", message: PROGRESS_GENERATING },
+      { kind: "clear" },
+      { kind: "set", message: PROGRESS_APPLYING },
+      { kind: "clear" },
+    ])
+    expect(progress.active()).toBeUndefined()
+    expect(context.invalidations).toEqual([])
+    expect(context.refreshes).toEqual([])
+    expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
+    expect(ui.toasts.some((toast) => toast.message.startsWith("New title"))).toBe(false)
+  })
+
+  test("clears the surface when a later dialog throws", async () => {
+    const ui = fakeUi({ select: ["run", "apply"] })
+    let calls = 0
+    ui.ui = {
+      ...ui.ui,
+      dialog: {
+        ...ui.ui.dialog,
+        select: () => {
+          calls += 1
+          return calls === 1 ? Promise.resolve("run" as never) : Promise.reject(new Error("confirm exploded"))
+        },
+      },
+    }
+    const { adapter, progress } = setup({ ui })
+
+    await expect(openRetitle(ui, adapter, "")).rejects.toThrow("confirm exploded")
+
+    expect(progress.active()).toBeUndefined()
+    expect(progress.events).toEqual([{ kind: "set", message: PROGRESS_GENERATING }, { kind: "clear" }])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("a rejected duplicate invocation never touches the active run's progress", async () => {
+    const generation = deferred<{ text: string }>()
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const { adapter, progress } = setup({ ui, client })
+
+    const first = openRetitle(ui, adapter, "")
+    await drainUntil(() => progress.active() !== undefined)
+
+    const second = openRetitle(ui, adapter, "")
+    await second
+
+    // The denied run opened no lane: the first run's surface is still up and the
+    // gate is still held.
+    expect(adapter.gate.running()).toBe(true)
+    expect(progress.active()).toBe(PROGRESS_GENERATING)
+    expect(progress.events).toEqual([{ kind: "set", message: PROGRESS_GENERATING }])
+    expect(ui.toasts.some((toast) => toast.message === "Retitle already running")).toBe(true)
+
+    generation.resolve({ text: "Generated title" })
+    await first
+
+    // One helper, one progress lifecycle, nothing left on screen or in the gate.
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.generates).toHaveLength(1)
+    expect(client.calls.renames).toHaveLength(1)
+    expect(progress.events).toEqual([
+      { kind: "set", message: PROGRESS_GENERATING },
+      { kind: "clear" },
+      { kind: "set", message: PROGRESS_APPLYING },
+      { kind: "clear" },
+    ])
+    expect(adapter.gate.running()).toBe(false)
+  })
+})
+
+describe("title write and refresh", () => {
+  test("refreshes the current session exactly once after a successful apply", async () => {
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const { adapter, context, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(context.invalidations).toEqual(["ses_current"])
+    expect(context.refreshes).toEqual(["ses_current"])
+    expect(ui.toasts.some((toast) => toast.variant === "success" && toast.message === "New title: Generated title")).toBe(true)
+  })
+
+  test("uses the live update contract when the runtime exposes no rename", async () => {
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const client = fakeClient({
+      withoutRename: true,
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+    })
+    const { adapter, context } = setup({ ui, client })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.updates).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(client.calls.renames).toEqual([])
+    expect(context.invalidations).toEqual(["ses_current"])
+    expect(context.refreshes).toEqual(["ses_current"])
+    expect(ui.toasts.some((toast) => toast.message.startsWith("New title"))).toBe(true)
+  })
+
+  test("still reports success when the refresh fails, and logs it", async () => {
+    const log = recordingLogger()
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const { adapter, context, client } = setup({ ui, refresh: "reject", logger: log.logger })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toHaveLength(1)
+    expect(context.invalidations).toEqual(["ses_current"])
+    expect(context.refreshes).toEqual(["ses_current"])
+    expect(ui.toasts.some((toast) => toast.variant === "success")).toBe(true)
+    expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(false)
+    expect(log.events.some((event) => event.name === "session-refresh-error")).toBe(true)
+  })
+
+  test("logs progress and the write operation as metadata, never the title", async () => {
+    const log = recordingLogger()
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const { adapter } = setup({ ui, logger: log.logger })
+
+    await openRetitle(ui, adapter, "")
+
+    const progressEvents = log.events.filter((event) => event.name.startsWith("progress-"))
+    expect(progressEvents).toEqual([
+      { name: "progress-shown", fields: { stage: "generating" } },
+      { name: "progress-cleared", fields: { stage: "generating" } },
+      { name: "progress-shown", fields: { stage: "applying" } },
+      { name: "progress-cleared", fields: { stage: "applying" } },
+    ])
+    expect(log.text()).not.toContain("Generated title")
   })
 })

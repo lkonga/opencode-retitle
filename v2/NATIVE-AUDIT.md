@@ -113,7 +113,7 @@ Why the helper session gives the native behaviour:
 
 | Operation | Client method | Pinned source | Installed runtime |
 |---|---|---|---|
-| Rename | `session.rename({ sessionID, title })` | `POST /api/session/:sessionID/rename`, 204 (`packages/protocol/src/groups/session.ts`) | `PATCH /api/session/:sessionID`, operation id `session.rename`, body `{ title }` |
+| Title write | `session.rename({ sessionID, title })` **or** `session.update({ sessionID, title })` | `session.rename` → `POST /api/session/:sessionID/rename`, operation id `v2.session.rename`, 204 void | `session.update` → `PATCH /api/session/{sessionID}`, operation id `session.update`, body `title: string \| null`, 204 void |
 | Generate | `session.generate({ sessionID, prompt })` | `POST …/generate` → `{ data: { text } }`, client unwraps to `{ text }` | same path, `SessionGenerateResponse` = `{ data: { text } }` |
 | Messages | `message.list({ sessionID, limit, order })` | `GET …/message` → `{ data, cursor }`, `limit` ≤ 200 | same path; adds a `type` filter; `limit` declared without a cap |
 | Model info | `data.location.model.list()` | `Model.Info.id` **and** `modelID` are distinct (`packages/schema/src/model.ts:90-112`); `Model.Ref.id` is matched against `Model.Info.id` (`packages/core/src/session/runner/model.ts:82`) | `Model.Info` carries both fields |
@@ -125,6 +125,54 @@ The plugin therefore:
   `normalizeMessagePage`, `normalizeCreatedSessionID` in `retitle-core.ts`), so a
   revision drift degrades to "no title" instead of a wrong write.
 
+### 4.1 Verified dual generated-client contract (2026-09-22)
+
+The two revisions expose **different generated methods** for the same action, and
+that difference is visible to a plugin author rather than hidden behind one name:
+
+| Contract | Generated method | Request | Operation id | Result |
+|---|---|---|---|---|
+| Pinned generated source | `context.client.session.rename({ sessionID, title }, { signal })` | `POST /api/session/:sessionID/rename` | `v2.session.rename` | 204 void |
+| Authenticated live OC2 runtime | `context.client.session.update({ sessionID, title }, { signal })` | `PATCH /api/session/{sessionID}` | `session.update` | 204 void (body `title: string \| null`) |
+
+An earlier revision of this audit read the PATCH route's handler as
+`session.rename`; the authenticated live `openapi.json` names that route's
+operation id `session.update`, and the generated client for it exposes
+`session.update` only. Since the adapter previously required `session.rename`
+unconditionally, a live **Apply** failed with `unsupported` even though the
+route was reachable.
+
+`applySessionTitle` (`session-api.ts`) therefore selects the write operation **by
+availability** and never by outcome:
+
+1. `session.rename` when the generated client exposes it (pinned source
+   contract);
+2. otherwise `session.update` (live runtime contract).
+
+Selection is a compatibility adapter over generated methods only — no path, verb
+or envelope is constructed. A rename that exists and then fails is a real
+failure: it is reported as `rename` and never silently retried through `update`,
+so at most one write is attempted per apply. Diagnostics record the selected
+operation (`operation: "rename" | "update"` in the log, and the deadline stage),
+never the title, the transcript or a provider payload.
+
+### 4.2 Reactive refresh after a write
+
+The write alone does not update the visible session title: the TUI reads it from
+its reactive `data.session` store. After a write the plugin therefore calls the
+documented store methods (`packages/plugin/src/tui/context.ts:65-84`):
+
+```ts
+context.data.session.invalidate(sessionID)   // drop the cached session row
+await context.data.session.sync(sessionID)   // re-read it
+```
+
+`refreshSessionTitle` (`session-api.ts`) does both, in that order, **best-effort**
+and bounded by its own deadline: the server write already succeeded, so a failed
+or hanging refresh is logged (`session-refresh-error`) and swallowed rather than
+reported as a failed apply. A runtime that stops publishing either method is
+recorded as `session-refresh-unsupported` and the success still stands.
+
 ## 5. Auto-title vs `/retitle`
 
 | | Automatic (native) | `/retitle` (this plugin) |
@@ -133,7 +181,7 @@ The plugin therefore:
 | Scope | root sessions only; only while still exactly untitled | any session, any number of times |
 | History | first user message only | bounded page (200 messages), tail-3 + spread sampling |
 | Model | `title` agent model, else the session model (a stale agent model is used, and fails at request time) | settings override (strict) → `title` agent model **only when the loaded catalogue carries it** → session model → first assistant model → first catalogue model |
-| Write | `SessionEvent.Renamed` (100-char cap, CAS on bus sequence) | `session.rename` after explicit Apply/Edit |
+| Write | `SessionEvent.Renamed` (100-char cap, CAS on bus sequence) | `session.rename`, else `session.update`, after explicit Apply/Edit, then a reactive `data.session.invalidate` + `sync` (§4.1, §4.2) |
 | Config | `agents.title.model` (`small_model` migrated at `packages/core/src/config/normalize.ts:123-140`) | own durable plugin state; `small_model` equivalent still read from the title agent |
 
 ## 6. Verification against the installed runtime (2026-09-16)
@@ -148,7 +196,7 @@ binary that actually serves it.
 | Check | Result |
 |---|---|
 | `session.generate` | `POST /api/session/{sessionID}/generate`, body `{ prompt }` only (the session is the path parameter), response `{ data: { text } }`. The plugin's `{ sessionID, prompt }` client call and its `text` / `data.text` reader both match. |
-| `session.rename` / `session.remove` | `PATCH` and `DELETE` on `/api/session/{sessionID}`, operation ids `session.rename` / `session.remove`. There is no `/rename` path in the installed spec — the divergence in §4 is real and is exactly why the plugin never builds a request. |
+| `session.rename` / `session.update` / `session.remove` | The installed spec has **no `/rename` path**: the title write is `PATCH /api/session/{sessionID}` with operation id `session.update` (body `title: string \| null`), removal is `DELETE /api/session/{sessionID}` with operation id `session.remove`. The pinned source's `session.rename` (`POST …/rename`) is a different generated method. Both are 204 void; the plugin picks whichever method the client exposes (§4.1) and never builds a request. |
 | `session.create` | Body `{ id?, title?, agent?, model?, location? }`; `model` is `Model.Ref { id, providerID, variant? }`, `location` is `Location.PublicRef { directory }`. The plugin sends exactly `{ title, agent, model, location }`. Excess properties are tolerated, not rejected — a bogus query parameter on `agent.list` still returns 200 — so a location that also carries `workspaceID` cannot break the helper create. |
 | `message.list` | Accepts `limit`, `order` (`asc`/`desc`), `cursor` and a `type` filter. `/retitle` sends one page, `limit=200&order=desc`, and never follows `cursor`. |
 | `Agent.Info.model` | `Model.Ref` (`id`, `providerID`, optional `variant`), optional on the agent. The live `agent.list` returns 68 agents including the hidden `title` agent, whose model is the configured `agents.title.model`. This is the value `models.ts` reads, prefers when the loaded catalogue carries it, and otherwise skips down the chain — there is no hardcoded model anywhere in the plugin. |
@@ -179,3 +227,39 @@ is worthwhile for that reason, not for `/retitle`.
 The plugin is listed exactly once in the live `cli.json` `plugins` array, so the
 V2 TUI loads it without duplicate command registration. Listing the same
 directory twice would register the keymap layer twice.
+
+## 7. Progress feedback surface (2026-09-22)
+
+`toast.show` (`packages/plugin/src/tui/context.ts:251-253`) is
+fire-and-forget — it returns the dismiss handle to nobody — so it cannot express
+"work in progress": a toast that outlives the run is a stuck UI and one that
+expires early is a lie. The documented surface that can is the dialog lifecycle:
+
+| Need | Public API | Citation |
+|---|---|---|
+| Show progress | `context.ui.dialog.show(render, onClose?)` | `packages/plugin/src/tui/context.ts:343`, `packages/tui/src/plugin/api.tsx:234-236` |
+| Dismiss progress | `context.ui.dialog.clear()` | `packages/plugin/src/tui/context.ts:347`, `packages/tui/src/plugin/api.tsx:241-243` |
+
+`dialog.set(options)` is **not** used: it carries presentation options
+(`{ size, centered }`), not content.
+
+`progress.ts` owns the lifetime, `tui.tsx` owns the single binding:
+
+* the module is render-free; it takes a structural
+  `{ set(message), clear() }` surface, so the whole lifecycle is testable without
+  a TUI and the JSX live only at the composition root, which is the only module
+  that knows the dialog;
+* a granted run owns one lane (`openRetitle` calls `progress.run()` only after
+  the gate grants), and every surface call is contained: a hostile or missing
+  dialog degrades to "no progress" instead of failing the run;
+* handles are token-checked, so an older handle can never dismiss a newer
+  surface, and `clear`/`release` are idempotent;
+* `withProgress` clears in `finally` on success, candidate cancel, deadline,
+  generation error, apply success, apply error and unexpected throw — no
+  intervals, no listeners and no globals, so nothing can outlive the run
+  (reload or disposal included);
+* a denied duplicate invocation returns before `progress.run()`, so it cannot
+  clear the active run's surface.
+
+Only the stage is logged (`progress-shown` / `progress-cleared` with
+`stage: "generating" | "applying"`); the message text and the title never are.

@@ -7,6 +7,8 @@ import {
   applySessionTitle,
   generateTitleText,
   loadSessionMessages,
+  refreshSessionTitle,
+  selectTitleWrite,
   supportsNativeGeneration,
   MESSAGE_PAGE_LIMIT,
 } from "../session-api"
@@ -252,5 +254,175 @@ describe("applySessionTitle", () => {
   test("reports a runtime without rename support", async () => {
     const client = { session: {}, message: {} } as never
     await expect(applySessionTitle(client, "ses_1", "x")).rejects.toMatchObject({ code: "unsupported" })
+  })
+
+  test("prefers the pinned rename contract and carries a request AbortSignal", async () => {
+    const { client, calls } = fakeClient()
+    const { logger, events } = captureLogger()
+
+    await applySessionTitle(client, "ses_1", "Deployment pipeline", { logger })
+
+    expect(calls.renames).toEqual([{ sessionID: "ses_1", title: "Deployment pipeline" }])
+    expect(calls.updates).toEqual([])
+    expect(calls.renameOptions).toHaveLength(1)
+    expect(calls.renameOptions[0]?.signal).toBeInstanceOf(AbortSignal)
+    expect(calls.renameOptions[0]?.signal?.aborted).toBe(false)
+    expect(events.find((event) => event.name === "title-updated")?.fields).toMatchObject({
+      sessionID: "ses_1",
+      operation: "rename",
+      titleLength: "Deployment pipeline".length,
+    })
+  })
+
+  test("falls back to the live update contract when the runtime has no rename", async () => {
+    const { client, calls } = fakeClient({ withoutRename: true })
+    const { logger, events } = captureLogger()
+
+    await applySessionTitle(client, "ses_1", "Live contract", { logger })
+
+    expect(calls.updates).toEqual([{ sessionID: "ses_1", title: "Live contract" }])
+    expect(calls.renames).toEqual([])
+    expect(calls.updateOptions).toHaveLength(1)
+    expect(calls.updateOptions[0]?.signal).toBeInstanceOf(AbortSignal)
+    expect(events.find((event) => event.name === "title-updated")?.fields).toMatchObject({ operation: "update" })
+  })
+
+  test("selects by availability, never by outcome", async () => {
+    const { client, calls } = fakeClient({
+      rename: () => {
+        throw new Error("rename rejected")
+      },
+    })
+
+    await expect(applySessionTitle(client, "ses_1", "x")).rejects.toMatchObject({ code: "rename" })
+    // A failed rename is a failed write: no second attempt through `update`.
+    expect(calls.updates).toEqual([])
+  })
+
+  test("names the selected operation in the error without leaking the title", async () => {
+    const { client } = fakeClient({
+      withoutRename: true,
+      update: () => {
+        throw new Error("update rejected: SESSION-TRANSCRIPT-MARKER")
+      },
+    })
+    const { logger, events, text } = captureLogger()
+
+    const failure = (await applySessionTitle(client, "ses_1", "SECRET-TITLE", { logger }).catch((error) => error)) as Error
+
+    expect(events.find((event) => event.name === "title-update-error")?.fields).toMatchObject({ operation: "update" })
+    expect(failure.message).toContain("session.update")
+    expect(failure.message).not.toContain("SECRET-TITLE")
+    expect(text()).not.toContain("SESSION-TRANSCRIPT-MARKER")
+    expect(text()).not.toContain("SECRET-TITLE")
+  })
+
+  test("bounds the write with a deadline that names the selected operation", async () => {
+    const { client } = fakeClient({ withoutRename: true, update: () => never() })
+    const { logger } = captureLogger()
+
+    const failure = (await applySessionTitle(client, "ses_1", "x", { logger, timeoutMs: 20 }).catch(
+      (error) => error,
+    )) as RetitleTimeoutError
+
+    expect(failure).toBeInstanceOf(RetitleTimeoutError)
+    expect(failure.stage).toBe("update")
+  })
+
+  test("reports the write operation it would use without calling it", () => {
+    const { client } = fakeClient()
+    expect(selectTitleWrite(client.session)?.operation).toBe("rename")
+    expect(selectTitleWrite(fakeClient({ withoutRename: true }).client.session)?.operation).toBe("update")
+    expect(selectTitleWrite({} as never)).toBeUndefined()
+  })
+
+  test("never issues a request of its own", async () => {
+    const original = globalThis.fetch
+    let fetches = 0
+    globalThis.fetch = (() => {
+      fetches += 1
+      throw new Error("the plugin must not hand-roll HTTP")
+    }) as unknown as typeof fetch
+    try {
+      const { client, calls } = fakeClient()
+      await applySessionTitle(client, "ses_1", "Deployment pipeline")
+      expect(fetches).toBe(0)
+      expect(calls.renames).toHaveLength(1)
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})
+
+describe("refreshSessionTitle", () => {
+  function recordingTarget(order: string[]) {
+    return {
+      invalidate: (sessionID: string) => void order.push(`invalidate:${sessionID}`),
+      sync: (sessionID: string) => {
+        order.push(`sync:${sessionID}`)
+        return Promise.resolve()
+      },
+    }
+  }
+
+  test("drops the cached session, then re-syncs it exactly once", async () => {
+    const order: string[] = []
+    const { logger, events } = captureLogger()
+
+    await refreshSessionTitle(recordingTarget(order), "ses_1", { logger })
+
+    expect(order).toEqual(["invalidate:ses_1", "sync:ses_1"])
+    expect(events.map((event) => event.name)).toEqual(["session-refreshed"])
+  })
+
+  test("contains a failing sync so a successful write is never reported failed", async () => {
+    const order: string[] = []
+    const { logger, events, text } = captureLogger()
+    const target = {
+      invalidate: (sessionID: string) => void order.push(`invalidate:${sessionID}`),
+      sync: () => Promise.reject(new Error("SESSION-TRANSCRIPT-MARKER")),
+    }
+
+    await refreshSessionTitle(target, "ses_1", { logger })
+
+    expect(order).toEqual(["invalidate:ses_1"])
+    expect(events.some((event) => event.name === "session-refresh-error")).toBe(true)
+    expect(text()).not.toContain("SESSION-TRANSCRIPT-MARKER")
+  })
+
+  test("contains a throwing invalidate and still syncs", async () => {
+    const order: string[] = []
+    const { logger, events } = captureLogger()
+    const target = {
+      invalidate: () => {
+        throw new Error("invalidate refused")
+      },
+      sync: (sessionID: string) => {
+        order.push(`sync:${sessionID}`)
+        return Promise.resolve()
+      },
+    }
+
+    await refreshSessionTitle(target, "ses_1", { logger })
+
+    expect(order).toEqual(["sync:ses_1"])
+    expect(events.filter((event) => event.name === "session-refresh-error")).toHaveLength(1)
+    expect(events.some((event) => event.name === "session-refreshed")).toBe(true)
+  })
+
+  test("bounds a hanging sync instead of hanging the apply", async () => {
+    const { logger, events } = captureLogger()
+
+    await refreshSessionTitle({ invalidate: () => {}, sync: () => never() }, "ses_1", { logger, timeoutMs: 20 })
+
+    expect(events.find((event) => event.name === "session-refresh-error")?.fields.timedOut).toBe(true)
+  })
+
+  test("degrades to a diagnostic when the runtime stopped publishing refresh", async () => {
+    const { logger, events } = captureLogger()
+
+    await refreshSessionTitle(undefined, "ses_1", { logger })
+
+    expect(events.filter((event) => event.name === "session-refresh-unsupported")).toHaveLength(2)
   })
 })

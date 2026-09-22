@@ -11,7 +11,10 @@
 //   * the gate is released in `finally`, so a thrown dialog, a cancelled
 //     dialog, or a failed generation can never wedge /retitle;
 //   * a title is only written after an explicit Apply/Edit confirmation, so a
-//     failure can never leave a half-applied title.
+//     failure can never leave a half-applied title;
+//   * progress is run-scoped (`progress.ts`): a granted run owns one lane and
+//     releases it in `finally`, so a denied duplicate invocation cannot dismiss
+//     the active run's surface and no surface can outlive its run.
 
 import {
   DEFAULT_FROM_PCT,
@@ -23,6 +26,12 @@ import {
 import { modelOptions } from "./models"
 import { effectiveModelLabel, type RetitleAdapter } from "./adapter"
 import { settingsFromArgs } from "./settings"
+import {
+  PROGRESS_APPLYING,
+  PROGRESS_GENERATING,
+  withProgress,
+  type ProgressRun,
+} from "./progress"
 import { applyRetitleTitle, executeRetitle, type RetitleOutcome } from "./runner"
 
 export type ToastVariant = "info" | "success" | "warning" | "error"
@@ -95,10 +104,15 @@ export async function openRetitle(
     return
   }
 
+  // Only a granted run owns a progress lane, so a denied duplicate invocation
+  // (which returns above) can never clear the active run's progress. The lane is
+  // released in `finally`, alongside the gate.
+  const run = adapter.progress.run()
   try {
     const settings = settingsFromArgs(adapter.settings.read(), rawArgs)
-    await settingsDialog(context, adapter, sessionID, settings)
+    await settingsDialog(context, adapter, sessionID, settings, run)
   } finally {
+    run.release()
     adapter.gate.end(grant.token)
   }
 }
@@ -113,6 +127,7 @@ export async function settingsDialog(
   adapter: RetitleAdapter,
   sessionID: string,
   settings: RetitleSettings,
+  run: ProgressRun,
 ): Promise<void> {
   for (;;) {
     const catalog = adapter.catalog()
@@ -165,8 +180,10 @@ export async function settingsDialog(
         settings.fromPct = DEFAULT_FROM_PCT
         settings.steering = ""
       }
-      const outcome = await executeRetitle(adapter.ports, { sessionID, settings, logger: adapter.logger })
-      const next = await handleOutcome(context, adapter, sessionID, outcome)
+      const outcome = await withProgress(run, PROGRESS_GENERATING, "generating", () =>
+        executeRetitle(adapter.ports, { sessionID, settings, logger: adapter.logger }),
+      )
+      const next = await handleOutcome(context, adapter, sessionID, outcome, run)
       if (next === "done") return
       continue
     }
@@ -217,10 +234,11 @@ async function handleOutcome(
   adapter: RetitleAdapter,
   sessionID: string,
   outcome: RetitleOutcome,
+  run: ProgressRun,
 ): Promise<"done" | "reopen"> {
   if (outcome.status === "ok") {
     const label = `${outcome.model.providerID}/${outcome.model.modelID}`
-    return confirmMenu(context, adapter, sessionID, outcome.title, label)
+    return confirmMenu(context, adapter, sessionID, outcome.title, label, run)
   }
   if (outcome.status === "empty") {
     adapter.logger.event("outcome-empty", { sessionID, messageCount: outcome.messageCount })
@@ -250,6 +268,7 @@ async function confirmMenu(
   sessionID: string,
   title: string,
   modelLabel: string,
+  run: ProgressRun,
 ): Promise<"done" | "reopen"> {
   const action = await context.ui.dialog.select<string>({
     title: `Retitle - "${title}"`,
@@ -263,7 +282,7 @@ async function confirmMenu(
   })
 
   if (action === "apply") {
-    await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel)
+    await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel, run)
     return "done"
   }
   if (action === "edit") {
@@ -275,7 +294,7 @@ async function confirmMenu(
       adapter.logger.event("edit-empty", { sessionID })
       return "done"
     }
-    await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel)
+    await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel, run)
     return "done"
   }
   if (action === "regenerate") return "reopen"
@@ -289,8 +308,13 @@ export async function applyConfirmedTitle(
   sessionID: string,
   title: string,
   modelLabel: string,
+  run: ProgressRun,
 ): Promise<boolean> {
-  const result = await applyRetitleTitle(adapter.ports, sessionID, title, adapter.logger)
+  // The write reports its own progress; the port resolves only after the
+  // reactive refresh, so the success toast below always follows write+refresh.
+  const result = await withProgress(run, PROGRESS_APPLYING, "applying", () =>
+    applyRetitleTitle(adapter.ports, sessionID, title, adapter.logger),
+  )
   if (!result.ok) {
     toast(context, adapter, `apply-error:${result.code}`, "error", "Failed to update session title")
     return false

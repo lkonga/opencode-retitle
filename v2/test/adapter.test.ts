@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test"
 import { createRetitleAdapter, effectiveModelLabel } from "../adapter"
 import { RetitleError } from "../errors"
 import type { RetitleMessage } from "../retitle-core"
-import { fakeCatalog, fakeClient, fakeContext, fakeStorage, userMessage } from "./fake"
+import { fakeCatalog, fakeClient, fakeContext, fakeStorage, recordingLogger, userMessage } from "./fake"
 
 function adapterFor(input: Parameters<typeof fakeContext>[0], options: Parameters<typeof createRetitleAdapter>[1] = {}) {
   const context = fakeContext(input)
@@ -27,6 +27,20 @@ describe("settings", () => {
     await adapter.settings.setModel("openai/gpt-5")
 
     expect(adapter.settings.read()).toEqual({ model: "openai/gpt-5" })
+    expect(storage.writes).toEqual([{ model: "openai/gpt-5" }])
+  })
+
+  test("keeps the model override when the adapter is recreated over the same host storage", async () => {
+    // A plugin reload builds a brand new context and adapter: the override must
+    // still be there because the durable host store outlives both.
+    const storage = fakeStorage()
+    const first = adapterFor({ client: fakeClient().client, storage: storage.storage })
+
+    await first.adapter.settings.setModel("openai/gpt-5")
+
+    const second = adapterFor({ client: fakeClient().client, storage: storage.storage })
+    expect(second.adapter.settings.read()).toEqual({ model: "openai/gpt-5" })
+    // The reloaded adapter read the durable value; it did not have to rewrite it.
     expect(storage.writes).toEqual([{ model: "openai/gpt-5" }])
   })
 
@@ -340,6 +354,83 @@ describe("generation wiring", () => {
     })
 
     expect(calls.creates[0].location).toEqual({ directory: "/workspace/default" })
+  })
+})
+
+describe("title write and reactive refresh", () => {
+  test("refreshes the session after a successful write, and never before it", async () => {
+    const { client, calls } = fakeClient()
+    const { context, adapter } = adapterFor({ client })
+
+    await adapter.ports.applyTitle("ses_1", "Deployment pipeline")
+
+    expect(calls.renames).toEqual([{ sessionID: "ses_1", title: "Deployment pipeline" }])
+    expect(context.invalidations).toEqual(["ses_1"])
+    expect(context.refreshes).toEqual(["ses_1"])
+    // The history-store sync is a different channel: the title refresh must not
+    // reuse it.
+    expect(context.syncs).toEqual([])
+  })
+
+  test("uses the live update contract when the runtime has no rename", async () => {
+    const { client, calls } = fakeClient({ withoutRename: true })
+    const { adapter } = adapterFor({ client })
+
+    await adapter.ports.applyTitle("ses_1", "Live contract")
+
+    expect(calls.updates).toEqual([{ sessionID: "ses_1", title: "Live contract" }])
+    expect(calls.renames).toEqual([])
+  })
+
+  test("does not refresh when the write failed", async () => {
+    const { client } = fakeClient({
+      rename: () => {
+        throw new Error("write refused")
+      },
+    })
+    const { context, adapter } = adapterFor({ client })
+
+    await expect(adapter.ports.applyTitle("ses_1", "x")).rejects.toMatchObject({ code: "rename" })
+    expect(context.invalidations).toEqual([])
+    expect(context.refreshes).toEqual([])
+  })
+
+  test("a failed refresh never turns a successful write into a failure", async () => {
+    const { client, calls } = fakeClient()
+    const context = fakeContext({ client, refresh: "reject" })
+    const log = recordingLogger()
+    const adapter = createRetitleAdapter(context, { logger: log.logger })
+
+    await expect(adapter.ports.applyTitle("ses_1", "Deployment pipeline")).resolves.toBeUndefined()
+
+    expect(calls.renames).toHaveLength(1)
+    expect(context.invalidations).toEqual(["ses_1"])
+    expect(context.refreshes).toEqual(["ses_1"])
+    expect(log.events.some((event) => event.name === "session-refresh-error")).toBe(true)
+  })
+
+  test("a throwing invalidate is contained and the sync still runs", async () => {
+    const { client } = fakeClient()
+    const context = fakeContext({ client, invalidateThrows: true })
+    const log = recordingLogger()
+    const adapter = createRetitleAdapter(context, { logger: log.logger })
+
+    await adapter.ports.applyTitle("ses_1", "x")
+
+    expect(context.refreshes).toEqual(["ses_1"])
+    expect(log.events.some((event) => event.name === "session-refresh-error")).toBe(true)
+  })
+
+  test("keeps working when the runtime publishes no refresh methods", async () => {
+    const { client, calls } = fakeClient()
+    const context = fakeContext({ client, refresh: "unsupported" })
+    const log = recordingLogger()
+    const adapter = createRetitleAdapter(context, { logger: log.logger })
+
+    await adapter.ports.applyTitle("ses_1", "x")
+
+    expect(calls.renames).toHaveLength(1)
+    expect(log.events.filter((event) => event.name === "session-refresh-unsupported")).toHaveLength(2)
   })
 })
 

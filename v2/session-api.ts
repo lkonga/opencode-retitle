@@ -2,18 +2,27 @@
 //
 // Everything here is expressed as public client-method calls. No wire path,
 // verb, or envelope is constructed by this plugin; the generated client owns
-// that. Two revisions of the runtime are known to be in play — the pinned
-// public source and the installed `v2.0.3-dev-patched` binary (see
-// NATIVE-AUDIT.md) — and they differ underneath (`session.rename` is
-// `POST /api/session/:id/rename` in the source and
-// `PATCH /api/session/:id` in the installed binary), which is exactly why the
-// plugin must not hand-roll requests.
+// that. Two revisions of the runtime are in play (see NATIVE-AUDIT.md) and they
+// expose *different generated methods* for the same action:
+//
+//   * pinned source contract: `session.rename({ sessionID, title })` →
+//     `POST /api/session/:sessionID/rename`, operation id `v2.session.rename`;
+//   * live runtime contract: `session.update({ sessionID, title })` →
+//     `PATCH /api/session/{sessionID}`, operation id `session.update`.
+//
+// `applySessionTitle` therefore selects **by availability**: rename when the
+// generated client has it, otherwise update. Selection is never by outcome — a
+// rename that exists and then fails is a real failure, so no second write is
+// attempted through a different verb.
 //
 // Boundaries enforced here:
 //   * history reads are bounded to one page, newest-first, never cursor-walked;
 //   * every request has a hard deadline and an AbortSignal;
 //   * the generation helper session is removed in `finally`, on a separate
 //     deadline, including when generation times out or fails;
+//   * a successful write is followed by a best-effort reactive refresh
+//     (`data.session.invalidate` + `sync`), which can never turn that write into
+//     a reported failure;
 //   * results are normalized tolerantly (`normalizeGeneratedText`,
 //     `normalizeMessagePage`, `normalizeCreatedSessionID`).
 
@@ -38,6 +47,8 @@ export const DEFAULT_HELPER_TIMEOUT_MS = 15_000
 export const DEFAULT_CLEANUP_TIMEOUT_MS = 5_000
 /** Title writes are small; a slow one means the server is unwell. */
 export const DEFAULT_RENAME_TIMEOUT_MS = 10_000
+/** Reactive refresh after a write: local store work, but still bounded. */
+export const DEFAULT_REFRESH_TIMEOUT_MS = 5_000
 /** Bounded history reads are one small page. */
 export const DEFAULT_HISTORY_TIMEOUT_MS = 10_000
 
@@ -63,7 +74,10 @@ export interface SessionApiClient {
     create?(input: Record<string, unknown>, options?: RequestOptionsLike): Promise<unknown>
     generate?(input: { sessionID: string; prompt: string }, options?: RequestOptionsLike): Promise<unknown>
     remove?(input: { sessionID: string }, options?: RequestOptionsLike): Promise<unknown>
+    /** Pinned source contract (`POST /api/session/:sessionID/rename`). */
     rename?(input: { sessionID: string; title: string }, options?: RequestOptionsLike): Promise<unknown>
+    /** Live runtime contract (`PATCH /api/session/{sessionID}`, `session.update`). */
+    update?(input: { sessionID: string; title: string }, options?: RequestOptionsLike): Promise<unknown>
   }
   readonly message: {
     list?(
@@ -71,6 +85,12 @@ export interface SessionApiClient {
       options?: RequestOptionsLike,
     ): Promise<unknown>
   }
+}
+
+/** The reactive `data.session` slice the refresh path needs. */
+export interface SessionRefreshTarget {
+  invalidate?(sessionID: string): void
+  sync?(sessionID: string): Promise<void>
 }
 
 export function supportsNativeGeneration(client: SessionApiClient): boolean {
@@ -229,10 +249,39 @@ async function removeHelper(
   }
 }
 
+/** A selected title write: the operation name plus a `this`-bound caller. */
+export interface TitleWriteOperation {
+  readonly operation: "rename" | "update"
+  readonly call: (
+    input: { sessionID: string; title: string },
+    options: RequestOptionsLike,
+  ) => Promise<unknown>
+}
+
 /**
- * Applies a title through the public rename method. The client method is
- * `session.rename` on both known revisions even though the underlying request
- * differs; nothing here depends on which one is installed.
+ * Picks the generated method to write a title with, preferring the pinned source
+ * contract (`session.rename`) and falling back to the live runtime contract
+ * (`session.update`). Availability decides; the outcome never does, so at most
+ * one write is attempted per apply.
+ */
+export function selectTitleWrite(session: SessionApiClient["session"] | undefined): TitleWriteOperation | undefined {
+  if (!session) return undefined
+  const rename = session.rename
+  if (typeof rename === "function") {
+    return { operation: "rename", call: (input, options) => rename.call(session, input, options) }
+  }
+  const update = session.update
+  if (typeof update === "function") {
+    return { operation: "update", call: (input, options) => update.call(session, input, options) }
+  }
+  return undefined
+}
+
+/**
+ * Applies a title through the public client, whichever generated method this
+ * runtime exposes (rename preferred, update fallback). Diagnostics name the
+ * selected operation and the failing stage; the title, the transcript and the
+ * provider payload are never logged.
  */
 export async function applySessionTitle(
   client: SessionApiClient,
@@ -240,19 +289,80 @@ export async function applySessionTitle(
   title: string,
   options: { readonly logger?: RetitleLogger; readonly timeoutMs?: number } = {},
 ): Promise<void> {
-  const session = client.session ?? {}
-  if (typeof session.rename !== "function") {
-    throw new RetitleError("unsupported", "This OpenCode V2 runtime does not expose session.rename")
+  const write = selectTitleWrite(client.session)
+  if (!write) {
+    throw new RetitleError(
+      "unsupported",
+      "This OpenCode V2 runtime exposes neither session.rename nor session.update",
+    )
   }
-  const deadline = createDeadline(options.timeoutMs ?? DEFAULT_RENAME_TIMEOUT_MS, "rename")
+  const deadline = createDeadline(options.timeoutMs ?? DEFAULT_RENAME_TIMEOUT_MS, write.operation)
   try {
-    await withDeadline(session.rename({ sessionID, title }, { signal: deadline.signal }), deadline)
-    options.logger?.event("title-updated", { sessionID, titleLength: title.length })
+    await withDeadline(write.call({ sessionID, title }, { signal: deadline.signal }), deadline)
+    options.logger?.event("title-updated", {
+      sessionID,
+      operation: write.operation,
+      titleLength: title.length,
+    })
   } catch (error) {
-    options.logger?.event("title-update-error", { sessionID, error, timedOut: error instanceof RetitleTimeoutError })
+    options.logger?.event("title-update-error", {
+      sessionID,
+      operation: write.operation,
+      error,
+      timedOut: error instanceof RetitleTimeoutError,
+    })
     throw error instanceof RetitleTimeoutError
       ? error
-      : new RetitleError("rename", "Failed to update session title", error)
+      : new RetitleError("rename", `Failed to update session title (session.${write.operation})`, error)
+  } finally {
+    deadline.dispose()
+  }
+}
+
+/**
+ * Makes a successful write visible to the reactive session store: drop the
+ * cached session info, then re-sync it. Deliberately never throws — the server
+ * write already succeeded, so a refresh failure is logged and swallowed rather
+ * than reported as a failed apply. A runtime that stopped publishing either
+ * method degrades to a diagnostic.
+ */
+export async function refreshSessionTitle(
+  session: SessionRefreshTarget | undefined,
+  sessionID: string,
+  options: { readonly logger?: RetitleLogger; readonly timeoutMs?: number } = {},
+): Promise<void> {
+  const { logger } = options
+  const target = session
+  let invalidated = false
+  const invalidate = target?.invalidate
+  if (target && typeof invalidate === "function") {
+    try {
+      invalidate.call(target, sessionID)
+      invalidated = true
+    } catch (error) {
+      logger?.event("session-refresh-error", { sessionID, stage: "invalidate", error })
+    }
+  } else {
+    logger?.event("session-refresh-unsupported", { sessionID, method: "invalidate" })
+  }
+
+  const sync = target?.sync
+  if (!target || typeof sync !== "function") {
+    logger?.event("session-refresh-unsupported", { sessionID, method: "sync" })
+    return
+  }
+  const deadline = createDeadline(options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS, "session-refresh")
+  try {
+    await withDeadline(sync.call(target, sessionID), deadline)
+    logger?.event("session-refreshed", { sessionID, invalidated })
+  } catch (error) {
+    logger?.event("session-refresh-error", {
+      sessionID,
+      stage: "sync",
+      invalidated,
+      timedOut: error instanceof RetitleTimeoutError,
+      error,
+    })
   } finally {
     deadline.dispose()
   }
