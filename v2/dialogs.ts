@@ -48,6 +48,7 @@ import {
 } from "./progress"
 import { applyRetitleTitle, executeRetitle, type RetitleOutcome } from "./runner"
 import type { GateGrant } from "./gate"
+import { continuousMenuOptions, handleContinuousAction } from "./continuous-dialog"
 
 export type ToastVariant = "info" | "success" | "warning" | "error"
 
@@ -266,10 +267,12 @@ export async function settingsDialog(
           description: "Sampling center point (0-100, 100 = end)",
         },
         { title: `Hint: ${settings.steering || "(none)"}`, value: "hint", category: "Adjust", description: "Steering hint for the title model" },
+        ...continuousMenuOptions(adapter, sessionID),
       ],
     })
 
     if (action === undefined) return
+    if (await handleContinuousAction(context, adapter, sessionID, action)) continue
 
     if (action === "run" || action === "reset") {
       if (action === "reset") {

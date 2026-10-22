@@ -31,6 +31,7 @@ import { createRunGate, createDebouncer, type RunGate } from "./gate"
 import { createRetitleLogger, type RetitleLogger } from "./logger"
 import { createProgressController, type ProgressController, type ProgressSurface } from "./progress"
 import type { RetitlePorts } from "./runner"
+import { TitleCandidateQueue } from "./shadow"
 
 export interface SessionInfoLike {
   readonly model?: CatalogModelRef | null
@@ -91,6 +92,7 @@ export interface RetitleAdapter {
   readonly settings: SettingsStore
   readonly logger: RetitleLogger
   readonly gate: RunGate
+  readonly candidates?: TitleCandidateQueue
   /** One progress controller per activation (see `progress.ts`). */
   readonly progress: ProgressController
   /** True when this failure key should raise a toast (debounced). */
@@ -200,9 +202,22 @@ export function createRetitleAdapter(context: RetitleContext, options: AdapterOp
     settings: createSettings(context, logger),
     logger,
     gate,
+    candidates: createCandidates(context, logger),
     progress,
     toastAllowed: (key) => toastDebouncer.allow(key),
     catalog,
+  }
+}
+
+/**
+ * Title candidate queue, or undefined when the host storage is unusable.
+ */
+function createCandidates(context: RetitleContext, logger: RetitleLogger): TitleCandidateQueue | undefined {
+  try {
+    return new TitleCandidateQueue(context.storage)
+  } catch (error) {
+    logger.event("candidate-queue-error", { error })
+    return undefined
   }
 }
 
