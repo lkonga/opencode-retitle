@@ -2,7 +2,7 @@
 // full lifecycle from slash/palette invocation to the title write.
 
 import { describe, expect, test } from "bun:test"
-import { createRetitleAdapter } from "../adapter"
+import { createRetitleAdapter, type RetitleAdapter } from "../adapter"
 import {
   RETITLE_AUTO_COMMAND_ID,
   RETITLE_AUTO_SLASH_NAME,
@@ -739,8 +739,10 @@ describe("auto lifecycle (/retitle-auto)", () => {
     const ui = fakeUiAtHome()
     const { adapter, progress } = setup({ ui })
 
-    await openRetitleAuto(ui, adapter, "")
+    const deltas: Array<1 | -1> = []
+    await openRetitleAuto(ui, adapter, "", (delta) => deltas.push(delta))
 
+    expect(deltas).toEqual([])
     expect(adapter.gate.running()).toBe(false)
     expect(progress.events).toEqual([])
     expect(ui.selects).toEqual([])
@@ -890,11 +892,19 @@ describe("auto lifecycle (/retitle-auto)", () => {
     const ui = fakeUi({})
     const { adapter, progress } = setup({ ui, client })
 
-    const first = openRetitleAuto(ui, adapter, "")
+    let pending = 0
+    const deltas: Array<1 | -1> = []
+    const trackPending = (delta: 1 | -1) => {
+      deltas.push(delta)
+      pending += delta
+    }
+    const first = openRetitleAuto(ui, adapter, "", trackPending)
     await drainUntil(() => client.calls.generates.length === 1)
 
-    const second = openRetitleAuto(ui, adapter, "")
+    const second = openRetitleAuto(ui, adapter, "", trackPending)
     await second
+    expect(pending).toBe(1)
+    expect(deltas).toEqual([1])
 
     // The second auto run is rejected: toast matches, no additional helper or generation
     expect(ui.toasts.some((toast) => toast.message === "Retitle already running")).toBe(true)
@@ -905,6 +915,8 @@ describe("auto lifecycle (/retitle-auto)", () => {
     generation.resolve({ text: "Generated title" })
     await first
 
+    expect(pending).toBe(0)
+    expect(deltas).toEqual([1, -1])
     expect(client.calls.creates).toHaveLength(1)
     expect(client.calls.generates).toHaveLength(1)
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
@@ -978,16 +990,11 @@ describe("auto lifecycle (/retitle-auto)", () => {
     const { adapter } = setup({ ui, client })
 
     let pending = 0
-    const runWithTracking = async () => {
-      pending += 1
-      try {
-        await openRetitleAuto(ui, adapter, "")
-      } finally {
-        pending = Math.max(0, pending - 1)
-      }
-    }
-
-    const promise = runWithTracking()
+    const deltas: Array<1 | -1> = []
+    const promise = openRetitleAuto(ui, adapter, "", (delta) => {
+      deltas.push(delta)
+      pending += delta
+    })
     expect(pending).toBe(1)
 
     await drainUntil(() => client.calls.generates.length === 1)
@@ -997,32 +1004,59 @@ describe("auto lifecycle (/retitle-auto)", () => {
     await promise
 
     expect(pending).toBe(0)
+    expect(deltas).toEqual([1, -1])
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Async title" }])
   })
 
-  test("tracks in-flight auto status count drops back to 0 on failure", async () => {
-    const client = fakeClient({
-      list: () => ({ data: [userMessage("hello")], cursor: {} }),
-      generate: () => {
-        throw new Error("generation error")
-      },
+  for (const [label, error] of [
+    ["failure", new Error("generation error")],
+    ["timeout", new RetitleTimeoutError(45_000, "generate")],
+    ["cancellation", new DOMException("Generation cancelled", "AbortError")],
+  ] as const) {
+    test(`tracks in-flight auto status count drops back to 0 on ${label}`, async () => {
+      const generation = deferred<{ text: string }>()
+      const client = fakeClient({
+        list: () => ({ data: [userMessage("hello")], cursor: {} }),
+        generate: () => generation.promise,
+      })
+      const ui = fakeUi({})
+      const { adapter } = setup({ ui, client })
+
+      let pending = 0
+      const deltas: Array<1 | -1> = []
+      const promise = openRetitleAuto(ui, adapter, "", (delta) => {
+        deltas.push(delta)
+        pending += delta
+      })
+      await drainUntil(() => client.calls.generates.length === 1)
+      expect(client.calls.generates).toHaveLength(1)
+      expect(pending).toBe(1)
+
+      generation.reject(error)
+      await promise
+      expect(pending).toBe(0)
+      expect(deltas).toEqual([1, -1])
+      expect(adapter.gate.running()).toBe(false)
+      expect(client.calls.removes).toEqual(["ses_helper"])
+      expect(client.calls.renames).toEqual([])
+      expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
     })
+  }
+
+  test("a throwing pending observer cannot interrupt auto work or cleanup", async () => {
     const ui = fakeUi({})
-    const { adapter } = setup({ ui, client })
+    const { adapter, client, progress } = setup({ ui })
+    const deltas: Array<1 | -1> = []
 
-    let pending = 0
-    const runWithTracking = async () => {
-      pending += 1
-      try {
-        await openRetitleAuto(ui, adapter, "")
-      } finally {
-        pending = Math.max(0, pending - 1)
-      }
-    }
+    await openRetitleAuto(ui, adapter, "", (delta) => {
+      deltas.push(delta)
+      throw new Error("status observer failed")
+    })
 
-    await runWithTracking()
-    expect(pending).toBe(0)
-    expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
+    expect(deltas).toEqual([1, -1])
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(adapter.gate.running()).toBe(false)
+    expect(progress.active()).toBeUndefined()
   })
 
   test("tracks in-flight status label for interactive /retitle and cleans up", async () => {

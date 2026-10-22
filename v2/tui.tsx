@@ -17,7 +17,7 @@
 import { createSignal, Show } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
 import { createRetitleAdapter, toRetitleContext } from "./adapter"
-import { retitleKeymapLayer } from "./command"
+import { RETITLE_AUTO_SLASH_NAME, retitleKeymapLayer } from "./command"
 import { openRetitle, openRetitleAuto } from "./dialogs"
 import type { ProgressSurface } from "./progress"
 
@@ -52,29 +52,22 @@ function dialogProgressSurface(dialog: Plugin.Context["ui"]["dialog"] | undefine
 function Commands(props: {
   context: Plugin.Context
   adapter: ReturnType<typeof createRetitleAdapter>
-  onStart: (label: string) => void
-  onEnd: () => void
+  onAutoPendingChange: (delta: 1 | -1) => void
+  onInteractivePendingChange: (delta: 1 | -1) => void
 }) {
   // `keymap.layer` is scoped to this component, so the layer is registered
   // exactly once per activation and is disposed with the plugin.
   props.context.keymap.layer(() =>
     retitleKeymapLayer(
       async (rawArgs) => {
-        props.onStart("/retitle")
+        props.onInteractivePendingChange(1)
         try {
           await openRetitle(props.context, props.adapter, rawArgs)
         } finally {
-          props.onEnd()
+          props.onInteractivePendingChange(-1)
         }
       },
-      async (rawArgs) => {
-        props.onStart("/retitle-auto")
-        try {
-          await openRetitleAuto(props.context, props.adapter, rawArgs)
-        } finally {
-          props.onEnd()
-        }
-      },
+      (rawArgs) => openRetitleAuto(props.context, props.adapter, rawArgs, props.onAutoPendingChange),
       (error) => props.adapter.logger.event("command-error", { error }),
     ),
   )
@@ -94,21 +87,19 @@ export default Plugin.define({
       progressSurface: dialogProgressSurface(context.ui?.dialog),
     })
 
-    const [activeLabel, setActiveLabel] = createSignal<string | null>(null)
+    const [pendingAuto, setPendingAuto] = createSignal(0)
+    const [pendingInteractive, setPendingInteractive] = createSignal(0)
 
-    // Footer status slot in /btw style: shows animated spinner and command label while in-flight
+    // Auto status follows granted runs, and takes priority over rejected commands.
     context.ui.slot({
       append: "prompt.footer.status",
       render: () => {
-        const color = () => context.theme?.hue?.interactive?.[200] ?? context.theme?.text?.muted
         return (
-          <Show when={activeLabel()}>
-            {(label) => (
+          <Show when={pendingAuto() > 0 || pendingInteractive() > 0}>
               <box flexShrink={0} flexDirection="row" gap={1}>
-                <spinner frames={SPINNER_FRAMES} interval={80} color={color()} />
-                <text fg={color()}>{label()}</text>
+                <spinner frames={SPINNER_FRAMES} interval={80} />
+                <text>{pendingAuto() > 0 ? `/${RETITLE_AUTO_SLASH_NAME}` : "/retitle"}</text>
               </box>
-            )}
           </Show>
         )
       },
@@ -120,8 +111,8 @@ export default Plugin.define({
         <Commands
           context={context}
           adapter={adapter}
-          onStart={(label) => setActiveLabel(label)}
-          onEnd={() => setActiveLabel(null)}
+          onAutoPendingChange={(delta) => setPendingAuto((n) => Math.max(0, n + delta))}
+          onInteractivePendingChange={(delta) => setPendingInteractive((n) => Math.max(0, n + delta))}
         />
       ),
     })

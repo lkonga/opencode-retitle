@@ -141,6 +141,7 @@ export async function openRetitleAuto(
   context: RetitleUiContext,
   adapter: RetitleAdapter,
   rawArgs: string,
+  onPendingChange?: (delta: 1 | -1) => void,
 ): Promise<void> {
   const route = context.ui.router.current()
   const sessionID = route?.type === "session" ? route.sessionID : undefined
@@ -157,7 +158,16 @@ export async function openRetitleAuto(
   // set/clear: in production the surface is `dialog.show`, which this path must
   // never touch.
   const run = adapter.progress.run({ silent: true })
+  // Inventory observers must not interrupt the run or its cleanup.
+  const notifyPending = (delta: 1 | -1) => {
+    try {
+      onPendingChange?.(delta)
+    } catch {
+      // A status observer is best-effort, not part of the retitle operation.
+    }
+  }
   try {
+    notifyPending(1)
     const settings = settingsFromArgs(adapter.settings.read(), rawArgs)
     const outcome = await withProgress(run, PROGRESS_GENERATING, "generating", () =>
       executeRetitle(adapter.ports, { sessionID, settings, logger: adapter.logger }),
@@ -180,8 +190,15 @@ export async function openRetitleAuto(
     adapter.logger.event("auto-error", { sessionID, error })
     toast(context, adapter, "auto-error", "error", "Retitle (auto) failed unexpectedly")
   } finally {
-    run.release()
-    adapter.gate.end(grant.token)
+    try {
+      run.release()
+    } finally {
+      try {
+        adapter.gate.end(grant.token)
+      } finally {
+        notifyPending(-1)
+      }
+    }
   }
 }
 
