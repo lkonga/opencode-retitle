@@ -1,8 +1,8 @@
-// The single /retitle command registration.
+// The /retitle and /retitle-auto command registrations.
 //
 // "Exactly once, in both the slash menu and the palette" is a structural
 // property here, not a convention: one command object carries both `palette`
-// and `slash`, and the layer returns exactly that object. There is no second
+// and `slash`, and the layer returns exactly one object per command. There is no second
 // slash-only or palette-only registration that could double up.
 //
 // `mode: "global"` is required, not cosmetic. A plugin layer defaults to base
@@ -33,6 +33,8 @@
 
 export const RETITLE_COMMAND_ID = "retitle.session.retitle"
 export const RETITLE_SLASH_NAME = "retitle"
+export const RETITLE_AUTO_COMMAND_ID = "retitle.session.retitle_auto"
+export const RETITLE_AUTO_SLASH_NAME = "retitle-auto"
 /** Fixed, non-remappable key stroke for the command (see the header). */
 export const RETITLE_BIND = "ctrl+shift+r"
 
@@ -41,7 +43,7 @@ export interface RetitleKeymapCommand {
   readonly title: string
   readonly description: string
   readonly group: string
-  readonly bind: string
+  readonly bind?: string
   readonly palette: true
   readonly slash: { readonly name: string; readonly arguments: true }
   readonly run: (input?: string) => void
@@ -56,14 +58,31 @@ export function createRetitleCommand(
   handler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
 ): RetitleKeymapCommand {
+  return createCommand(false, handler, onError)
+}
+
+export function createRetitleAutoCommand(
+  handler: (rawArgs: string) => void | Promise<void>,
+  onError?: (error: unknown) => void,
+): RetitleKeymapCommand {
+  return createCommand(true, handler, onError)
+}
+
+function createCommand(
+  auto: boolean,
+  handler: (rawArgs: string) => void | Promise<void>,
+  onError?: (error: unknown) => void,
+): RetitleKeymapCommand {
   return {
-    id: RETITLE_COMMAND_ID,
-    title: "Retitle Session (Recent)",
-    description: "Retitle the session from sampled recent turns. Args: [hint], --samples N, --from P%, --offset N",
+    id: auto ? RETITLE_AUTO_COMMAND_ID : RETITLE_COMMAND_ID,
+    title: auto ? "Retitle Session (Auto)" : "Retitle Session (Recent)",
+    description: auto
+      ? "Generate and apply a title with current settings, without dialogs. Args: [hint], --samples N, --from P%, --offset N"
+      : "Retitle the session from sampled recent turns. Args: [hint], --samples N, --from P%, --offset N",
     group: "Session",
-    bind: RETITLE_BIND,
+    ...(!auto ? { bind: RETITLE_BIND } : {}),
     palette: true,
-    slash: { name: RETITLE_SLASH_NAME, arguments: true },
+    slash: { name: auto ? RETITLE_AUTO_SLASH_NAME : RETITLE_SLASH_NAME, arguments: true },
     run: (input) => {
       // The handler owns its own error surface (it toasts); anything escaping it
       // is a bug that must not become an unhandled rejection in the keymap.
@@ -74,10 +93,11 @@ export function createRetitleCommand(
   }
 }
 
-/** The plugin's complete keymap contribution: exactly one layer, one command. */
+/** The plugin's complete keymap contribution: one global layer, both commands. */
 export function retitleKeymapLayer(
   handler: (rawArgs: string) => void | Promise<void>,
+  autoHandler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
 ): RetitleKeymapLayer {
-  return { mode: "global", commands: [createRetitleCommand(handler, onError)] }
+  return { mode: "global", commands: [createRetitleCommand(handler, onError), createRetitleAutoCommand(autoHandler, onError)] }
 }

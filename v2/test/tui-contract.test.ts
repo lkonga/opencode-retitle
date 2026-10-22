@@ -69,7 +69,7 @@ describe("V2 entrypoint", () => {
   test("imports only the runtime-mapped plugin specifier at the top level", () => {
     const tui = path.join(v2, "tui.tsx")
     const bare = importsOf(tui).filter((specifier) => !specifier.startsWith("."))
-    expect(bare).toEqual(["@opencode/plugin/tui"])
+    expect(bare.sort()).toEqual(["@opencode/plugin/tui", "solid-js"].sort())
 
     // Every internal import resolves inside the V2 directory.
     for (const specifier of importsOf(tui).filter((item) => item.startsWith("."))) {
@@ -79,15 +79,16 @@ describe("V2 entrypoint", () => {
     }
   })
 
-  test("mounts one app slot and registers one keymap layer", () => {
+  test("mounts app and prompt.footer.status slots and registers one keymap layer", () => {
     // The one guarantee a local test cannot observe behaviourally: the plugin
     // is activated by the runtime, and only the runtime can say how many times
     // `setup` ran. Counted on comment-stripped source; the runtime smoke on the
     // V2 binary (recorded on issue #239) covers the behavioural side.
     const source = code(read(path.join(v2, "tui.tsx")))
-    expect(source.match(/ui\.slot\(/g)).toHaveLength(1)
+    expect(source.match(/ui\.slot\(/g)).toHaveLength(2)
     expect(source.match(/keymap\.layer\(/g)).toHaveLength(1)
     expect(source).toContain('append: "app"')
+    expect(source).toContain('append: "prompt.footer.status"')
     expect(source).toContain("Plugin.define({")
   })
 })

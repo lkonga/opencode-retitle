@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-// OpenCode V2 TUI entrypoint for /retitle.
+// OpenCode V2 TUI entrypoint for /retitle and /retitle-auto.
 //
 // This file is deliberately tiny: it mounts one component in the `app` slot and
 // registers one keymap layer. All behaviour lives in the modules it imports, so
@@ -14,11 +14,14 @@
 //
 // The V1 entrypoint (`../tui.ts`) is untouched and still loads under V1.
 
+import { createSignal, Show } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
 import { createRetitleAdapter, toRetitleContext } from "./adapter"
 import { retitleKeymapLayer } from "./command"
-import { openRetitle } from "./dialogs"
+import { openRetitle, openRetitleAuto } from "./dialogs"
 import type { ProgressSurface } from "./progress"
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 /**
  * Binds the render-free progress surface to the documented public dialog
@@ -46,12 +49,25 @@ function dialogProgressSurface(dialog: Plugin.Context["ui"]["dialog"] | undefine
   }
 }
 
-function Commands(props: { context: Plugin.Context; adapter: ReturnType<typeof createRetitleAdapter> }) {
+function Commands(props: {
+  context: Plugin.Context
+  adapter: ReturnType<typeof createRetitleAdapter>
+  onAutoStart: () => void
+  onAutoEnd: () => void
+}) {
   // `keymap.layer` is scoped to this component, so the layer is registered
   // exactly once per activation and is disposed with the plugin.
   props.context.keymap.layer(() =>
     retitleKeymapLayer(
       (rawArgs) => openRetitle(props.context, props.adapter, rawArgs),
+      async (rawArgs) => {
+        props.onAutoStart()
+        try {
+          await openRetitleAuto(props.context, props.adapter, rawArgs)
+        } finally {
+          props.onAutoEnd()
+        }
+      },
       (error) => props.adapter.logger.event("command-error", { error }),
     ),
   )
@@ -70,6 +86,35 @@ export default Plugin.define({
     const adapter = createRetitleAdapter(toRetitleContext(context), {
       progressSurface: dialogProgressSurface(context.ui?.dialog),
     })
-    return context.ui.slot({ append: "app", render: () => <Commands context={context} adapter={adapter} /> })
+
+    const [pendingAuto, setPendingAuto] = createSignal(0)
+
+    // Footer status slot in /btw style: shows animated spinner and /retitle-auto label while in-flight
+    context.ui.slot({
+      append: "prompt.footer.status",
+      render: () => {
+        const color = () => context.theme?.hue?.interactive?.[200] ?? context.theme?.text?.muted
+        return (
+          <Show when={pendingAuto() > 0}>
+            <box flexShrink={0} flexDirection="row" gap={1}>
+              <spinner frames={SPINNER_FRAMES} interval={80} color={color()} />
+              <text fg={color()}>/retitle-auto</text>
+            </box>
+          </Show>
+        )
+      },
+    })
+
+    return context.ui.slot({
+      append: "app",
+      render: () => (
+        <Commands
+          context={context}
+          adapter={adapter}
+          onAutoStart={() => setPendingAuto((n) => n + 1)}
+          onAutoEnd={() => setPendingAuto((n) => Math.max(0, n - 1))}
+        />
+      ),
+    })
   },
 })

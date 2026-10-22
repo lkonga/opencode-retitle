@@ -62,7 +62,7 @@ export interface ProgressController {
    * Opens a progress lane for one granted run. A rejected invocation never
    * reaches this point, so it cannot touch another run's progress.
    */
-  run(): ProgressRun
+  run(options?: { readonly silent?: boolean }): ProgressRun
   /** True while a surface is up. Diagnostics and tests only. */
   readonly active: boolean
 }
@@ -71,25 +71,27 @@ export function createProgressController(
   surface: ProgressSurface | undefined,
   logger?: RetitleLogger,
 ): ProgressController {
-  type Entry = { readonly owner: symbol; readonly token: symbol; readonly stage: ProgressStage }
+  type Entry = { readonly owner: symbol; readonly token: symbol; readonly stage: ProgressStage; readonly silent: boolean }
   let current: Entry | undefined
 
   /** Drops `entry` if it is still the current one; idempotent by construction. */
   const dismiss = (entry: Entry): void => {
     if (current?.token !== entry.token) return
     current = undefined
-    contain(() => surface?.clear(), logger, "progress-clear-error")
+    if (!entry.silent) contain(() => surface?.clear(), logger, "progress-clear-error")
     logger?.event("progress-cleared", { stage: entry.stage })
   }
 
   return {
-    run(): ProgressRun {
+    run(options): ProgressRun {
       const owner = Symbol("retitle-progress-run")
+      // Unattended runs retain stage logging without opening or clearing dialogs.
+      const silent = options?.silent === true
       return {
         show(message, stage): ProgressHandle {
-          const entry: Entry = { owner, token: Symbol("retitle-progress"), stage }
+          const entry: Entry = { owner, token: Symbol("retitle-progress"), stage, silent }
           current = entry
-          contain(() => surface?.set(message), logger, "progress-show-error")
+          if (!silent) contain(() => surface?.set(message), logger, "progress-show-error")
           logger?.event("progress-shown", { stage })
           return {
             clear() {
