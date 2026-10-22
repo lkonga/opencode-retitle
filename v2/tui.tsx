@@ -52,20 +52,27 @@ function dialogProgressSurface(dialog: Plugin.Context["ui"]["dialog"] | undefine
 function Commands(props: {
   context: Plugin.Context
   adapter: ReturnType<typeof createRetitleAdapter>
-  onAutoStart: () => void
-  onAutoEnd: () => void
+  onStart: (label: string) => void
+  onEnd: () => void
 }) {
   // `keymap.layer` is scoped to this component, so the layer is registered
   // exactly once per activation and is disposed with the plugin.
   props.context.keymap.layer(() =>
     retitleKeymapLayer(
-      (rawArgs) => openRetitle(props.context, props.adapter, rawArgs),
       async (rawArgs) => {
-        props.onAutoStart()
+        props.onStart("/retitle")
+        try {
+          await openRetitle(props.context, props.adapter, rawArgs)
+        } finally {
+          props.onEnd()
+        }
+      },
+      async (rawArgs) => {
+        props.onStart("/retitle-auto")
         try {
           await openRetitleAuto(props.context, props.adapter, rawArgs)
         } finally {
-          props.onAutoEnd()
+          props.onEnd()
         }
       },
       (error) => props.adapter.logger.event("command-error", { error }),
@@ -87,19 +94,21 @@ export default Plugin.define({
       progressSurface: dialogProgressSurface(context.ui?.dialog),
     })
 
-    const [pendingAuto, setPendingAuto] = createSignal(0)
+    const [activeLabel, setActiveLabel] = createSignal<string | null>(null)
 
-    // Footer status slot in /btw style: shows animated spinner and /retitle-auto label while in-flight
+    // Footer status slot in /btw style: shows animated spinner and command label while in-flight
     context.ui.slot({
       append: "prompt.footer.status",
       render: () => {
         const color = () => context.theme?.hue?.interactive?.[200] ?? context.theme?.text?.muted
         return (
-          <Show when={pendingAuto() > 0}>
-            <box flexShrink={0} flexDirection="row" gap={1}>
-              <spinner frames={SPINNER_FRAMES} interval={80} color={color()} />
-              <text fg={color()}>/retitle-auto</text>
-            </box>
+          <Show when={activeLabel()}>
+            {(label) => (
+              <box flexShrink={0} flexDirection="row" gap={1}>
+                <spinner frames={SPINNER_FRAMES} interval={80} color={color()} />
+                <text fg={color()}>{label()}</text>
+              </box>
+            )}
           </Show>
         )
       },
@@ -111,8 +120,8 @@ export default Plugin.define({
         <Commands
           context={context}
           adapter={adapter}
-          onAutoStart={() => setPendingAuto((n) => n + 1)}
-          onAutoEnd={() => setPendingAuto((n) => Math.max(0, n - 1))}
+          onStart={(label) => setActiveLabel(label)}
+          onEnd={() => setActiveLabel(null)}
         />
       ),
     })

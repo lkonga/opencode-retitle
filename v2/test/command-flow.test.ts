@@ -1024,4 +1024,36 @@ describe("auto lifecycle (/retitle-auto)", () => {
     expect(pending).toBe(0)
     expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
   })
+
+  test("tracks in-flight status label for interactive /retitle and cleans up", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({ select: ["run", "apply"] })
+    const { adapter } = setup({ ui, client })
+
+    let activeLabel: string | null = null
+    const runInteractive = async () => {
+      activeLabel = "/retitle"
+      try {
+        await openRetitle(ui, adapter, "")
+      } finally {
+        activeLabel = null
+      }
+    }
+
+    const promise = runInteractive()
+    expect(activeLabel).toBe("/retitle")
+
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(activeLabel).toBe("/retitle")
+
+    generation.resolve({ text: "Interactive title" })
+    await promise
+
+    expect(activeLabel).toBeNull()
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Interactive title" }])
+  })
 })
