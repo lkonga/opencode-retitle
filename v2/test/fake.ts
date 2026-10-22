@@ -273,7 +273,7 @@ export type FakeUi = RetitleUiContext & {
 
 /** A dialog that answers each call from a queue; `undefined` cancels. */
 export function fakeUi(answers: {
-  readonly select?: Array<string | undefined>
+  readonly select?: Array<string | boolean | undefined>
   readonly prompt?: Array<string | undefined>
 }): FakeUi {
   const toasts: FakeUi["toasts"] = []

@@ -128,7 +128,7 @@ describe("V2 module graph", () => {
   test("progress adds no timer, listener or global, and no second registration", () => {
     // The progress surface must not be able to outlive its run (or its plugin
     // activation) and must not add a second slot claim or keymap layer: it is
-    // drawn on the public dialog and owned by the run's `finally`.
+    // drawn only in the footer, without opening or clearing dialogs.
     for (const file of ["progress.ts", "tui.tsx"]) {
       const source = code(read(path.join(v2, file)))
       expect(source, `${file} must not schedule timers, listeners or globals`).not.toMatch(
@@ -136,8 +136,8 @@ describe("V2 module graph", () => {
       )
     }
     const tui = code(read(path.join(v2, "tui.tsx")))
-    expect(tui).toContain("dialog.show(")
-    expect(tui).toContain("dialog.clear()")
+    expect(tui).not.toMatch(/dialog\.(show|clear)\s*\(/)
+    expect(tui).toContain('append: "prompt.footer.status"')
   })
 })
 

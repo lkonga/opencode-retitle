@@ -176,7 +176,7 @@ describe("command registration", () => {
 
 describe("run lifecycle", () => {
   test("applies the generated title once and cleans the helper up", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -228,7 +228,7 @@ describe("run lifecycle", () => {
     // with the fallback resolved by the chain, and the prompt must still go to a
     // fresh helper session pinned to the `title` agent.
     const logged: Array<{ name: string; fields: Record<string, unknown> }> = []
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({ list: () => ({ data: [userMessage("hello")], cursor: {} }) })
     const context = fakeContext({
       client: client.client,
@@ -273,12 +273,47 @@ describe("run lifecycle", () => {
   })
 
   test("applies an edited title instead of the generated one", async () => {
-    const ui = fakeUi({ select: ["run", "edit"], prompt: ["  My edited title  "] })
+    const ui = fakeUi({ select: ["run", "edit", true], prompt: ["  My edited title  "] })
     const { adapter, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
 
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "My edited title" }])
+  })
+
+  test("apply requires confirmation (Y/n); declining returns to menu, confirming applies", async () => {
+    // 1. run -> 2. apply -> 3. false (n, decline apply) -> 4. apply -> 5. true (Y, confirm apply)
+    const ui = fakeUi({ select: ["run", "apply", false, "apply", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects).toHaveLength(5)
+    expect(ui.selects[2].title).toContain('Apply title "Generated title"?')
+    expect(ui.selects[4].title).toContain('Apply title "Generated title"?')
+  })
+
+  test("closing via escape/cancel requires confirmation (y/N); default N keeps menu open", async () => {
+    // 1. run -> 2. cancel -> 3. false (N, keep menu open) -> 4. apply -> 5. true (Y, apply)
+    const ui = fakeUi({ select: ["run", "cancel", false, "apply", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects[2].title).toBe("Discard generated title?")
+  })
+
+  test("explicit confirmation (y) on discard confirmation closes without applying", async () => {
+    // 1. run -> 2. cancel -> 3. true (y, confirm discard)
+    const ui = fakeUi({ select: ["run", "cancel", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
   })
 
   test("writes nothing when the candidate is cancelled", async () => {
@@ -309,7 +344,7 @@ describe("run lifecycle", () => {
         return { text: `Title ${call}` }
       },
     })
-    const ui = fakeUi({ select: ["run", "regenerate", "run", "apply"] })
+    const ui = fakeUi({ select: ["run", "regenerate", "run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     await openRetitle(ui, adapter, "")
@@ -385,7 +420,7 @@ describe("duplicate suppression", () => {
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => gate.promise,
     })
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     const first = openRetitle(ui, adapter, "")
@@ -415,15 +450,15 @@ describe("duplicate suppression", () => {
 
     await openRetitle(ui, adapter, "")
 
-    // Only the first run reached the settings dialog and the confirm menu.
-    expect(ui.selects).toHaveLength(2)
+    // Only the first run reached the settings dialog, confirm menu, and confirm apply.
+    expect(ui.selects).toHaveLength(3)
     expect(client.calls.creates).toHaveLength(1)
     expect(client.calls.generates).toHaveLength(1)
   })
 
   test("a later invocation is accepted once the window has passed", async () => {
     let now = 0
-    const ui = fakeUi({ select: ["run", "cancel", "run", "cancel"] })
+    const ui = fakeUi({ select: ["run", "cancel", true, "run", "cancel", true] })
     const client = fakeClient({ list: () => ({ data: [userMessage("hello")], cursor: {} }) })
     const context = fakeContext({
       client: client.client,
@@ -436,14 +471,14 @@ describe("duplicate suppression", () => {
     now += 5_000
     await openRetitle(ui, adapter, "")
 
-    expect(ui.selects).toHaveLength(4)
+    expect(ui.selects).toHaveLength(6)
     expect(client.calls.creates).toHaveLength(2)
   })
 })
 
 describe("progress feedback", () => {
   test("shows generation then apply progress, clearing each in turn", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, progress } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -507,7 +542,7 @@ describe("progress feedback", () => {
   })
 
   test("clears apply progress when the write fails, with no refresh and no success toast", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       rename: () => {
@@ -532,7 +567,7 @@ describe("progress feedback", () => {
   })
 
   test("clears the surface when a later dialog throws", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     let calls = 0
     ui.ui = {
       ...ui.ui,
@@ -555,7 +590,7 @@ describe("progress feedback", () => {
 
   test("a rejected duplicate invocation never touches the active run's progress", async () => {
     const generation = deferred<{ text: string }>()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => generation.promise,
@@ -594,7 +629,7 @@ describe("progress feedback", () => {
 
 describe("title write and refresh", () => {
   test("refreshes the current session exactly once after a successful apply", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, context, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -606,7 +641,7 @@ describe("title write and refresh", () => {
   })
 
   test("uses the live update contract when the runtime exposes no rename", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       withoutRename: true,
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
@@ -624,7 +659,7 @@ describe("title write and refresh", () => {
 
   test("still reports success when the refresh fails, and logs it", async () => {
     const log = recordingLogger()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, context, client } = setup({ ui, refresh: "reject", logger: log.logger })
 
     await openRetitle(ui, adapter, "")
@@ -639,7 +674,7 @@ describe("title write and refresh", () => {
 
   test("logs progress and the write operation as metadata, never the title", async () => {
     const log = recordingLogger()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, logger: log.logger })
 
     await openRetitle(ui, adapter, "")
@@ -832,7 +867,7 @@ describe("auto lifecycle (/retitle-auto)", () => {
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => generation.promise,
     })
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     const first = openRetitle(ui, adapter, "")
@@ -860,7 +895,7 @@ describe("auto lifecycle (/retitle-auto)", () => {
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => generation.promise,
     })
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, progress } = setup({ ui, client })
 
     const first = openRetitleAuto(ui, adapter, "")
@@ -1065,7 +1100,7 @@ describe("auto lifecycle (/retitle-auto)", () => {
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => generation.promise,
     })
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     let activeLabel: string | null = null

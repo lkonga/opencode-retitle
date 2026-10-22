@@ -368,35 +368,78 @@ async function confirmMenu(
   modelLabel: string,
   run: ProgressRun,
 ): Promise<"done" | "reopen"> {
-  const action = await context.ui.dialog.select<string>({
-    title: `Retitle - "${title}"`,
-    current: "apply",
-    options: [
-      { title: "Apply", value: "apply", description: "Set this as the session title" },
-      { title: "Edit...", value: "edit", description: "Modify the title before applying" },
-      { title: "Regenerate", value: "regenerate", description: "Run again with different settings" },
-      { title: "Cancel", value: "cancel", description: "Discard this title" },
-    ],
-  })
+  for (let loop = 0; loop < 20; loop++) {
+    const action = await context.ui.dialog.select<string>({
+      title: `Retitle - "${title}"`,
+      current: "apply",
+      options: [
+        { title: "Apply", value: "apply", description: "Set this as the session title" },
+        { title: "Edit...", value: "edit", description: "Modify the title before applying" },
+        { title: "Regenerate", value: "regenerate", description: "Run again with different settings" },
+        { title: "Cancel", value: "cancel", description: "Discard this title" },
+      ],
+    })
 
-  if (action === "apply") {
-    await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel, run)
-    return "done"
-  }
-  if (action === "edit") {
-    const edited = await context.ui.dialog.prompt({ title: "Edit title", value: title, placeholder: "Session title" })
-    if (edited === undefined) return "done"
-    const trimmed = edited.trim()
-    if (!trimmed) {
-      // An empty edit discards the candidate rather than writing an empty title.
-      adapter.logger.event("edit-empty", { sessionID })
-      return "done"
+    if (action === undefined || action === "cancel") {
+      const confirmDiscard = await context.ui.dialog.select<boolean>({
+        title: "Discard generated title?",
+        current: false,
+        options: [
+          { title: "No, keep title (N)", value: false, description: "Return to title menu" },
+          { title: "Yes, discard title (y)", value: true, description: "Close without applying" },
+        ],
+      })
+      if (confirmDiscard === true || confirmDiscard === undefined) {
+        adapter.logger.event("discarded", { sessionID })
+        return "done"
+      }
+      continue
     }
-    await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel, run)
+
+    if (action === "apply") {
+      const confirmApply = await context.ui.dialog.select<boolean>({
+        title: `Apply title "${title}"?`,
+        current: true,
+        options: [
+          { title: "Yes, apply title (Y)", value: true, description: "Set this as the session title" },
+          { title: "No, return to menu (n)", value: false, description: "Return without applying" },
+        ],
+      })
+      if (confirmApply === true) {
+        await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel, run)
+        return "done"
+      }
+      continue
+    }
+
+    if (action === "edit") {
+      const edited = await context.ui.dialog.prompt({ title: "Edit title", value: title, placeholder: "Session title" })
+      if (edited === undefined) continue
+      const trimmed = edited.trim()
+      if (!trimmed) {
+        // An empty edit discards the candidate rather than writing an empty title.
+        adapter.logger.event("edit-empty", { sessionID })
+        continue
+      }
+      const confirmApply = await context.ui.dialog.select<boolean>({
+        title: `Apply title "${trimmed}"?`,
+        current: true,
+        options: [
+          { title: "Yes, apply title (Y)", value: true, description: "Set this as the session title" },
+          { title: "No, return to menu (n)", value: false, description: "Return without applying" },
+        ],
+      })
+      if (confirmApply === true) {
+        await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel, run)
+        return "done"
+      }
+      continue
+    }
+
+    if (action === "regenerate") return "reopen"
+    adapter.logger.event("discarded", { sessionID })
     return "done"
   }
-  if (action === "regenerate") return "reopen"
-  adapter.logger.event("discarded", { sessionID })
   return "done"
 }
 
