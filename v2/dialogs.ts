@@ -1,4 +1,15 @@
-// Dialog lifecycle for /retitle: run gate -> settings -> generation -> confirm -> apply.
+// Lifecycle for /retitle and /retitle-auto: run gate -> settings -> generation ->
+// confirm -> apply.
+//
+// Two entry points share one lifecycle and one run gate, and differ only in
+// whether the user is asked anything:
+//
+//   * `openRetitle` (interactive) walks the settings dialog and the confirm
+//     menu, so a run is only written after an explicit Apply/Edit.
+//   * `openRetitleAuto` (`/retitle-auto`, unattended) never opens, shows or
+//     clears a dialog: settings come from the saved state plus the raw args, the
+//     first title is applied as-is, and every failure is reported through the
+//     log and a toast only.
 //
 // This module owns the *lifecycle*, not the API. It reads `Plugin.Context`'s
 // documented dialog/toast/router surface through a structural type, which keeps
@@ -6,12 +17,15 @@
 //
 // Ordering guarantees:
 //   * the run gate is claimed synchronously before any `await`, so a second
-//     /retitle (double Enter, palette + slash) is rejected instead of opening a
-//     second dialog or starting a second generation;
+//     invocation (double Enter, palette + slash, or /retitle racing
+//     /retitle-auto) is rejected instead of opening a second dialog or starting
+//     a second generation;
 //   * the gate is released in `finally`, so a thrown dialog, a cancelled
-//     dialog, or a failed generation can never wedge /retitle;
-//   * a title is only written after an explicit Apply/Edit confirmation, so a
-//     failure can never leave a half-applied title;
+//     dialog, or a failed generation can never wedge either command;
+//   * interactive `/retitle` writes a title only after an explicit Apply/Edit
+//     confirmation, so a failure can never leave a half-applied title;
+//     `/retitle-auto` writes the first candidate by design, which is why it is
+//     reachable only from the palette and the slash menu — never a key stroke;
 //   * progress is run-scoped (`progress.ts`): a granted run owns one lane and
 //     releases it in `finally`, so a denied duplicate invocation cannot dismiss
 //     the active run's surface and no surface can outlive its run.
@@ -33,6 +47,8 @@ import {
   type ProgressRun,
 } from "./progress"
 import { applyRetitleTitle, executeRetitle, type RetitleOutcome } from "./runner"
+import type { GateGrant } from "./gate"
+import { continuousMenuOptions, handleContinuousAction } from "./continuous-dialog"
 
 export type ToastVariant = "info" | "success" | "warning" | "error"
 
@@ -82,6 +98,8 @@ export interface RetitleUiContext {
 }
 
 const NO_SESSION_MESSAGE = "Open a session before using /retitle"
+const AUTO_NO_SESSION_MESSAGE = "Open a session before using /retitle-auto"
+const IN_FLIGHT_MESSAGE = "Retitle already running"
 
 /** Entry point for the slash command and the palette command. */
 export async function openRetitle(
@@ -97,12 +115,8 @@ export async function openRetitle(
     return
   }
 
-  const grant = adapter.gate.begin()
-  if (!grant.ok) {
-    adapter.logger.event("rejected", { reason: grant.reason })
-    if (grant.reason === "in-flight") toast(context, adapter, "in-flight", "warning", "Retitle already running")
-    return
-  }
+  const grant = claimRun(context, adapter)
+  if (!grant) return
 
   // Only a granted run owns a progress lane, so a denied duplicate invocation
   // (which returns above) can never clear the active run's progress. The lane is
@@ -115,6 +129,91 @@ export async function openRetitle(
     run.release()
     adapter.gate.end(grant.token)
   }
+}
+
+/**
+ * Entry point for `/retitle-auto`: one unattended pass, no UI. The session is
+ * verified, the gate is claimed synchronously, settings come from the saved
+ * state plus the raw args, and the first candidate title is applied directly.
+ * Nothing on this path may open a dialog, so the settings dialog and confirm
+ * menu are skipped entirely; failures only log and toast.
+ */
+export async function openRetitleAuto(
+  context: RetitleUiContext,
+  adapter: RetitleAdapter,
+  rawArgs: string,
+  onPendingChange?: (delta: 1 | -1) => void,
+): Promise<void> {
+  const route = context.ui.router.current()
+  const sessionID = route?.type === "session" ? route.sessionID : undefined
+  if (!sessionID) {
+    adapter.logger.event("no-session", { route: route?.type ?? "unknown", auto: true })
+    toast(context, adapter, "no-session", "warning", AUTO_NO_SESSION_MESSAGE)
+    return
+  }
+
+  const grant = claimRun(context, adapter)
+  if (!grant) return
+
+  // `silent` keeps the run's lane and its progress logs but suppresses surface
+  // set/clear: in production the surface is `dialog.show`, which this path must
+  // never touch.
+  const run = adapter.progress.run({ silent: true })
+  // Inventory observers must not interrupt the run or its cleanup.
+  const notifyPending = (delta: 1 | -1) => {
+    try {
+      onPendingChange?.(delta)
+    } catch {
+      // A status observer is best-effort, not part of the retitle operation.
+    }
+  }
+  try {
+    notifyPending(1)
+    const settings = settingsFromArgs(adapter.settings.read(), rawArgs)
+    const outcome = await withProgress(run, PROGRESS_GENERATING, "generating", () =>
+      executeRetitle(adapter.ports, { sessionID, settings, logger: adapter.logger }),
+    )
+
+    if (outcome.status !== "ok") {
+      // Failure surface only: `handleOutcome` never opens a dialog for a non-ok
+      // outcome (it logs and toasts), and its "reopen" answer is meaningless
+      // here because there is no settings loop to return to.
+      await handleOutcome(context, adapter, sessionID, outcome, run)
+      return
+    }
+
+    const label = `${outcome.model.providerID}/${outcome.model.modelID}`
+    adapter.logger.event("auto-apply", { sessionID, model: label })
+    await applyConfirmedTitle(context, adapter, sessionID, outcome.title, label, run)
+  } catch (error) {
+    // `executeRetitle` reports its own failures, so a throw here is unexpected.
+    // It must still leave the toast as the only trace and release the lane.
+    adapter.logger.event("auto-error", { sessionID, error })
+    toast(context, adapter, "auto-error", "error", "Retitle (auto) failed unexpectedly")
+  } finally {
+    try {
+      run.release()
+    } finally {
+      try {
+        adapter.gate.end(grant.token)
+      } finally {
+        notifyPending(-1)
+      }
+    }
+  }
+}
+
+/**
+ * Claims the shared run gate synchronously, before any `await`. Interactive and
+ * auto runs go through the same helper, so each rejects the other with the same
+ * log event and the same toast.
+ */
+function claimRun(context: RetitleUiContext, adapter: RetitleAdapter): GateGrant | undefined {
+  const grant = adapter.gate.begin()
+  if (grant.ok) return grant
+  adapter.logger.event("rejected", { reason: grant.reason })
+  if (grant.reason === "in-flight") toast(context, adapter, "in-flight", "warning", IN_FLIGHT_MESSAGE)
+  return undefined
 }
 
 /**
@@ -168,10 +267,12 @@ export async function settingsDialog(
           description: "Sampling center point (0-100, 100 = end)",
         },
         { title: `Hint: ${settings.steering || "(none)"}`, value: "hint", category: "Adjust", description: "Steering hint for the title model" },
+        ...continuousMenuOptions(adapter, sessionID),
       ],
     })
 
     if (action === undefined) return
+    if (await handleContinuousAction(context, adapter, sessionID, action)) continue
 
     if (action === "run" || action === "reset") {
       if (action === "reset") {
@@ -270,35 +371,78 @@ async function confirmMenu(
   modelLabel: string,
   run: ProgressRun,
 ): Promise<"done" | "reopen"> {
-  const action = await context.ui.dialog.select<string>({
-    title: `Retitle - "${title}"`,
-    current: "apply",
-    options: [
-      { title: "Apply", value: "apply", description: "Set this as the session title" },
-      { title: "Edit...", value: "edit", description: "Modify the title before applying" },
-      { title: "Regenerate", value: "regenerate", description: "Run again with different settings" },
-      { title: "Cancel", value: "cancel", description: "Discard this title" },
-    ],
-  })
+  for (let loop = 0; loop < 20; loop++) {
+    const action = await context.ui.dialog.select<string>({
+      title: `Retitle - "${title}"`,
+      current: "apply",
+      options: [
+        { title: "Apply", value: "apply", description: "Set this as the session title" },
+        { title: "Edit...", value: "edit", description: "Modify the title before applying" },
+        { title: "Regenerate", value: "regenerate", description: "Run again with different settings" },
+        { title: "Cancel", value: "cancel", description: "Discard this title" },
+      ],
+    })
 
-  if (action === "apply") {
-    await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel, run)
-    return "done"
-  }
-  if (action === "edit") {
-    const edited = await context.ui.dialog.prompt({ title: "Edit title", value: title, placeholder: "Session title" })
-    if (edited === undefined) return "done"
-    const trimmed = edited.trim()
-    if (!trimmed) {
-      // An empty edit discards the candidate rather than writing an empty title.
-      adapter.logger.event("edit-empty", { sessionID })
-      return "done"
+    if (action === undefined || action === "cancel") {
+      const confirmDiscard = await context.ui.dialog.select<boolean>({
+        title: "Discard generated title?",
+        current: false,
+        options: [
+          { title: "No, keep title (N)", value: false, description: "Return to title menu" },
+          { title: "Yes, discard title (y)", value: true, description: "Close without applying" },
+        ],
+      })
+      if (confirmDiscard === true || confirmDiscard === undefined) {
+        adapter.logger.event("discarded", { sessionID })
+        return "done"
+      }
+      continue
     }
-    await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel, run)
+
+    if (action === "apply") {
+      const confirmApply = await context.ui.dialog.select<boolean>({
+        title: `Apply title "${title}"?`,
+        current: true,
+        options: [
+          { title: "Yes, apply title (Y)", value: true, description: "Set this as the session title" },
+          { title: "No, return to menu (n)", value: false, description: "Return without applying" },
+        ],
+      })
+      if (confirmApply === true) {
+        await applyConfirmedTitle(context, adapter, sessionID, title, modelLabel, run)
+        return "done"
+      }
+      continue
+    }
+
+    if (action === "edit") {
+      const edited = await context.ui.dialog.prompt({ title: "Edit title", value: title, placeholder: "Session title" })
+      if (edited === undefined) continue
+      const trimmed = edited.trim()
+      if (!trimmed) {
+        // An empty edit discards the candidate rather than writing an empty title.
+        adapter.logger.event("edit-empty", { sessionID })
+        continue
+      }
+      const confirmApply = await context.ui.dialog.select<boolean>({
+        title: `Apply title "${trimmed}"?`,
+        current: true,
+        options: [
+          { title: "Yes, apply title (Y)", value: true, description: "Set this as the session title" },
+          { title: "No, return to menu (n)", value: false, description: "Return without applying" },
+        ],
+      })
+      if (confirmApply === true) {
+        await applyConfirmedTitle(context, adapter, sessionID, trimmed, modelLabel, run)
+        return "done"
+      }
+      continue
+    }
+
+    if (action === "regenerate") return "reopen"
+    adapter.logger.event("discarded", { sessionID })
     return "done"
   }
-  if (action === "regenerate") return "reopen"
-  adapter.logger.event("discarded", { sessionID })
   return "done"
 }
 

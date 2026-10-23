@@ -2,19 +2,22 @@
 // full lifecycle from slash/palette invocation to the title write.
 
 import { describe, expect, test } from "bun:test"
-import { createRetitleAdapter } from "../adapter"
+import { createRetitleAdapter, type RetitleAdapter } from "../adapter"
 import {
+  RETITLE_AUTO_COMMAND_ID,
+  RETITLE_AUTO_SLASH_NAME,
   RETITLE_BIND,
   RETITLE_COMMAND_ID,
   RETITLE_SLASH_NAME,
+  createRetitleAutoCommand,
   createRetitleCommand,
   retitleKeymapLayer,
 } from "../command"
 import { RetitleTimeoutError } from "../deadline"
-import { openRetitle } from "../dialogs"
+import { openRetitle, openRetitleAuto } from "../dialogs"
 import { PROGRESS_APPLYING, PROGRESS_GENERATING } from "../progress"
 import type { RetitleLogger } from "../logger"
-import { fakeCatalog, fakeClient, fakeContext, fakeProgress, fakeUi, fakeUiAtHome, recordingLogger, userMessage } from "./fake"
+import { assistantMessage, fakeCatalog, fakeClient, fakeContext, fakeProgress, fakeUi, fakeUiAtHome, recordingLogger, userMessage } from "./fake"
 import type { SessionApiClient } from "../session-api"
 
 function deferred<T>() {
@@ -39,6 +42,7 @@ function setup(options: {
   readonly catalog?: ReturnType<typeof fakeCatalog>
   readonly refresh?: "ok" | "reject" | "unsupported"
   readonly logger?: RetitleLogger
+  readonly now?: () => number
 }) {
   const client = options.client ?? fakeClient({ list: () => ({ data: options.messages ?? [userMessage("hello")], cursor: {} }) })
   const context = fakeContext({
@@ -51,43 +55,58 @@ function setup(options: {
   const adapter = createRetitleAdapter(context, {
     logger: options.logger ?? { event: () => {} },
     progressSurface: progress.surface,
+    ...(options.now ? { now: options.now } : {}),
   })
   return { client, context, adapter, ui: options.ui, progress }
 }
 
 describe("command registration", () => {
-  test("registers exactly one command that is both a slash command and a palette command", () => {
-    const layer = retitleKeymapLayer(() => {})
+  test("registers the interactive and the auto command, each as a slash and palette command", () => {
+    const layer = retitleKeymapLayer(
+      () => {},
+      () => {},
+    )
     expect(layer.mode).toBe("global")
-    expect(layer.commands).toHaveLength(1)
+    expect(layer.commands).toHaveLength(2)
 
-    const [command] = layer.commands
+    const [command, auto] = layer.commands
     expect(command.id).toBe(RETITLE_COMMAND_ID)
     expect(command.palette).toBe(true)
     expect(command.slash).toEqual({ name: RETITLE_SLASH_NAME, arguments: true })
+
+    expect(auto.id).toBe(RETITLE_AUTO_COMMAND_ID)
+    expect(auto.palette).toBe(true)
+    expect(auto.slash).toEqual({ name: RETITLE_AUTO_SLASH_NAME, arguments: true })
+    expect(RETITLE_AUTO_COMMAND_ID).toBe("retitle.session.retitle_auto")
+    expect(RETITLE_AUTO_SLASH_NAME).toBe("retitle-auto")
+    expect(new Set(layer.commands.map((entry) => entry.id)).size).toBe(2)
+    expect(new Set(layer.commands.map((entry) => entry.slash?.name)).size).toBe(2)
   })
 
-  test("carries a raw binding alongside the palette and slash reachability", () => {
-    const layer = retitleKeymapLayer(() => {})
+  test("binds exactly one fixed stroke, owned by the interactive command alone", () => {
+    const layer = retitleKeymapLayer(
+      () => {},
+      () => {},
+    )
 
     // The runtime's layer builder validates the entry shape: an entry with an
     // `id`, `palette` and `slash` is a *named* command, while an entry without
     // an `id` may only carry `bind` ("Inline keymap commands require bind",
     // "Palette commands require an ID"). Both together are what makes this one
     // reachable command that also owns a key stroke, not an inline shortcut.
-    expect(layer.commands).toHaveLength(1)
-    const [command] = layer.commands
+    const [command, auto] = layer.commands
     expect(typeof command.id).toBe("string")
     expect(command.palette).toBe(true)
     expect(command.slash).toBeDefined()
     expect(typeof command.bind).toBe("string")
     expect(command.bind).toBe(RETITLE_BIND)
-  })
 
-  test("binds one fixed stroke that no other command in the layer claims", () => {
-    const layer = retitleKeymapLayer(() => {})
-    const strokes = layer.commands.flatMap((command) =>
-      typeof command.bind === "string" ? command.bind.split(",").map((stroke) => stroke.trim()) : [],
+    // The auto command is deliberately stroke-less: an unattended title write
+    // must never be one stray keypress away from the interactive one.
+    expect("bind" in auto).toBe(false)
+
+    const strokes = layer.commands.flatMap((entry) =>
+      typeof entry.bind === "string" ? entry.bind.split(",").map((stroke) => stroke.trim()) : [],
     )
 
     // A single stroke: the command fires on its own key, not on a sequence it
@@ -98,32 +117,50 @@ describe("command registration", () => {
     expect(new Set(strokes).size).toBe(strokes.length)
   })
 
-  test("delivers the raw argument string to the handler exactly once per invocation", async () => {
+  test("delivers the raw argument string to each handler exactly once per invocation", async () => {
     const seen: string[] = []
+    const autoSeen: string[] = []
     const command = createRetitleCommand((rawArgs) => {
       seen.push(rawArgs)
+    })
+    const auto = createRetitleAutoCommand((rawArgs) => {
+      autoSeen.push(rawArgs)
     })
 
     command.run("--samples 20 docker setup")
     command.run()
+    auto.run("--samples 5")
+    auto.run()
 
     await Promise.resolve()
     expect(seen).toEqual(["--samples 20 docker setup", ""])
+    expect(autoSeen).toEqual(["--samples 5", ""])
   })
 
   test("contains a handler failure instead of rejecting into the keymap", async () => {
     const errors: unknown[] = []
+    const autoErrors: unknown[] = []
     const command = createRetitleCommand(
       () => {
         throw new Error("boom")
       },
       (error) => errors.push(error),
     )
+    const auto = createRetitleAutoCommand(
+      async () => {
+        throw new Error("auto boom")
+      },
+      (error) => autoErrors.push(error),
+    )
 
     expect(() => command.run()).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    expect(() => auto.run()).not.toThrow()
+    // An async handler's rejection is adopted a tick later than a sync throw,
+    // and the two commands are independent promises: drain deterministically
+    // instead of guessing a fixed number of microtasks.
+    await drainUntil(() => errors.length === 1 && autoErrors.length === 1)
     expect(errors).toHaveLength(1)
+    expect(autoErrors).toHaveLength(1)
   })
 
   test("refuses to run without a session and never claims the run gate", async () => {
@@ -139,7 +176,7 @@ describe("command registration", () => {
 
 describe("run lifecycle", () => {
   test("applies the generated title once and cleans the helper up", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -191,7 +228,7 @@ describe("run lifecycle", () => {
     // with the fallback resolved by the chain, and the prompt must still go to a
     // fresh helper session pinned to the `title` agent.
     const logged: Array<{ name: string; fields: Record<string, unknown> }> = []
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({ list: () => ({ data: [userMessage("hello")], cursor: {} }) })
     const context = fakeContext({
       client: client.client,
@@ -236,12 +273,47 @@ describe("run lifecycle", () => {
   })
 
   test("applies an edited title instead of the generated one", async () => {
-    const ui = fakeUi({ select: ["run", "edit"], prompt: ["  My edited title  "] })
+    const ui = fakeUi({ select: ["run", "edit", true], prompt: ["  My edited title  "] })
     const { adapter, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
 
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "My edited title" }])
+  })
+
+  test("apply requires confirmation (Y/n); declining returns to menu, confirming applies", async () => {
+    // 1. run -> 2. apply -> 3. false (n, decline apply) -> 4. apply -> 5. true (Y, confirm apply)
+    const ui = fakeUi({ select: ["run", "apply", false, "apply", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects).toHaveLength(5)
+    expect(ui.selects[2].title).toContain('Apply title "Generated title"?')
+    expect(ui.selects[4].title).toContain('Apply title "Generated title"?')
+  })
+
+  test("closing via escape/cancel requires confirmation (y/N); default N keeps menu open", async () => {
+    // 1. run -> 2. cancel -> 3. false (N, keep menu open) -> 4. apply -> 5. true (Y, apply)
+    const ui = fakeUi({ select: ["run", "cancel", false, "apply", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects[2].title).toBe("Discard generated title?")
+  })
+
+  test("explicit confirmation (y) on discard confirmation closes without applying", async () => {
+    // 1. run -> 2. cancel -> 3. true (y, confirm discard)
+    const ui = fakeUi({ select: ["run", "cancel", true] })
+    const { adapter, client } = setup({ ui })
+
+    await openRetitle(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
   })
 
   test("writes nothing when the candidate is cancelled", async () => {
@@ -272,7 +344,7 @@ describe("run lifecycle", () => {
         return { text: `Title ${call}` }
       },
     })
-    const ui = fakeUi({ select: ["run", "regenerate", "run", "apply"] })
+    const ui = fakeUi({ select: ["run", "regenerate", "run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     await openRetitle(ui, adapter, "")
@@ -348,7 +420,7 @@ describe("duplicate suppression", () => {
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => gate.promise,
     })
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, client })
 
     const first = openRetitle(ui, adapter, "")
@@ -378,15 +450,15 @@ describe("duplicate suppression", () => {
 
     await openRetitle(ui, adapter, "")
 
-    // Only the first run reached the settings dialog and the confirm menu.
-    expect(ui.selects).toHaveLength(2)
+    // Only the first run reached the settings dialog, confirm menu, and confirm apply.
+    expect(ui.selects).toHaveLength(3)
     expect(client.calls.creates).toHaveLength(1)
     expect(client.calls.generates).toHaveLength(1)
   })
 
   test("a later invocation is accepted once the window has passed", async () => {
     let now = 0
-    const ui = fakeUi({ select: ["run", "cancel", "run", "cancel"] })
+    const ui = fakeUi({ select: ["run", "cancel", true, "run", "cancel", true] })
     const client = fakeClient({ list: () => ({ data: [userMessage("hello")], cursor: {} }) })
     const context = fakeContext({
       client: client.client,
@@ -399,14 +471,14 @@ describe("duplicate suppression", () => {
     now += 5_000
     await openRetitle(ui, adapter, "")
 
-    expect(ui.selects).toHaveLength(4)
+    expect(ui.selects).toHaveLength(6)
     expect(client.calls.creates).toHaveLength(2)
   })
 })
 
 describe("progress feedback", () => {
   test("shows generation then apply progress, clearing each in turn", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, progress } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -470,7 +542,7 @@ describe("progress feedback", () => {
   })
 
   test("clears apply progress when the write fails, with no refresh and no success toast", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       rename: () => {
@@ -495,7 +567,7 @@ describe("progress feedback", () => {
   })
 
   test("clears the surface when a later dialog throws", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     let calls = 0
     ui.ui = {
       ...ui.ui,
@@ -518,7 +590,7 @@ describe("progress feedback", () => {
 
   test("a rejected duplicate invocation never touches the active run's progress", async () => {
     const generation = deferred<{ text: string }>()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
       generate: () => generation.promise,
@@ -557,7 +629,7 @@ describe("progress feedback", () => {
 
 describe("title write and refresh", () => {
   test("refreshes the current session exactly once after a successful apply", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, context, client } = setup({ ui })
 
     await openRetitle(ui, adapter, "")
@@ -569,7 +641,7 @@ describe("title write and refresh", () => {
   })
 
   test("uses the live update contract when the runtime exposes no rename", async () => {
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const client = fakeClient({
       withoutRename: true,
       list: () => ({ data: [userMessage("hello")], cursor: {} }),
@@ -587,7 +659,7 @@ describe("title write and refresh", () => {
 
   test("still reports success when the refresh fails, and logs it", async () => {
     const log = recordingLogger()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter, context, client } = setup({ ui, refresh: "reject", logger: log.logger })
 
     await openRetitle(ui, adapter, "")
@@ -602,7 +674,7 @@ describe("title write and refresh", () => {
 
   test("logs progress and the write operation as metadata, never the title", async () => {
     const log = recordingLogger()
-    const ui = fakeUi({ select: ["run", "apply"] })
+    const ui = fakeUi({ select: ["run", "apply", true] })
     const { adapter } = setup({ ui, logger: log.logger })
 
     await openRetitle(ui, adapter, "")
@@ -615,5 +687,442 @@ describe("title write and refresh", () => {
       { name: "progress-cleared", fields: { stage: "applying" } },
     ])
     expect(log.text()).not.toContain("Generated title")
+  })
+})
+
+describe("auto lifecycle (/retitle-auto)", () => {
+  test("applies the first candidate with default settings and never opens a dialog", async () => {
+    const ui = fakeUi({})
+    const { adapter, client, progress, context } = setup({ ui })
+
+    await openRetitleAuto(ui, adapter, "")
+
+    // No settings dialog, no confirm menu, no prompt — and no progress surface,
+    // because the auto run's lane is silent (in production it is `dialog.show`).
+    expect(ui.selects).toEqual([])
+    expect(ui.prompts).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(progress.active()).toBeUndefined()
+
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.generates).toHaveLength(1)
+    expect(client.calls.removes).toEqual(["ses_helper"])
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(context.refreshes).toEqual(["ses_current"])
+    expect(ui.toasts).toEqual([{ variant: "success", message: "New title: Generated title" }])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("seeds sampling and the steering hint from the raw argument string", async () => {
+    const oldestFirst = [
+      userMessage("turn 0 oldest user turn"),
+      assistantMessage("turn 0 reply"),
+      userMessage("turn 1 middle user turn"),
+      assistantMessage("turn 1 reply"),
+      userMessage("turn 2 recent user turn"),
+      assistantMessage("turn 2 reply"),
+      userMessage("turn 3 newest user turn"),
+      assistantMessage("turn 3 reply"),
+    ]
+    const client = fakeClient({ list: () => ({ data: [...oldestFirst].reverse(), cursor: {} }) })
+    const ui = fakeUi({})
+    const { adapter } = setup({ ui, client, messages: oldestFirst })
+
+    // --offset 4 limits history to the last 4 messages (turns 2 and 3).
+    // --samples 2 selects both turns; "deploy notes" becomes the steering hint.
+    await openRetitleAuto(ui, adapter, "--samples 2 --offset 4 deploy notes")
+
+    const [generation] = client.calls.generates
+    expect(generation.prompt).toContain("deploy notes")
+    expect(generation.prompt).toContain("turn 3 newest user turn")
+    expect(generation.prompt).toContain("turn 2 recent user turn")
+    expect(generation.prompt).not.toContain("turn 0 oldest user turn")
+    expect(generation.prompt).not.toContain("turn 1 middle user turn")
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects).toEqual([])
+  })
+
+  test("respects saved model settings and resolves it through the catalog for generation", async () => {
+    const log = recordingLogger()
+    const ui = fakeUi({})
+    const catalog = fakeCatalog({
+      models: [
+        { id: "gpt-5", providerID: "openai" },
+        { id: "claude-3-haiku", providerID: "anthropic" },
+      ],
+    })
+    const { adapter, client } = setup({ ui, catalog, logger: log.logger })
+
+    await adapter.settings.setModel("anthropic/claude-3-haiku")
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.creates[0].model).toEqual({ id: "claude-3-haiku", providerID: "anthropic" })
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects).toEqual([])
+    expect(ui.prompts).toEqual([])
+    expect(log.events.find((event) => event.name === "model-selected")?.fields).toMatchObject({
+      providerID: "anthropic",
+      modelID: "claude-3-haiku",
+      modelSource: "settings-override",
+      hasOverride: true,
+    })
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("refuses to run without a session, names /retitle-auto, and never claims the gate", async () => {
+    const ui = fakeUiAtHome()
+    const { adapter, progress } = setup({ ui })
+
+    const deltas: Array<1 | -1> = []
+    await openRetitleAuto(ui, adapter, "", (delta) => deltas.push(delta))
+
+    expect(deltas).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+    expect(progress.events).toEqual([])
+    expect(ui.selects).toEqual([])
+    expect(ui.toasts).toEqual([{ variant: "warning", message: "Open a session before using /retitle-auto" }])
+  })
+
+  test("reports an empty session without opening anything and releases the gate", async () => {
+    const ui = fakeUi({})
+    const client = fakeClient({ list: () => ({ data: [], cursor: {} }) })
+    const { adapter, progress } = setup({ ui, client, messages: [] })
+
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(ui.selects).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(ui.toasts.some((toast) => toast.variant === "warning" && toast.message.startsWith("Nothing to retitle yet"))).toBe(true)
+    expect(client.calls.renames).toEqual([])
+    expect(client.calls.generates).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("reports a model that returned no title without reopening settings", async () => {
+    const ui = fakeUi({})
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => ({ text: "   " }),
+    })
+    const { adapter } = setup({ ui, client })
+
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(ui.selects).toEqual([])
+    expect(ui.prompts).toEqual([])
+    expect(ui.toasts).toEqual([
+      { variant: "warning", message: "No title came back from openai/gpt-5. Pick another model in settings." },
+    ])
+    expect(client.calls.renames).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("surfaces a generation failure as a toast only, with no dialog and no write", async () => {
+    const ui = fakeUi({})
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => {
+        throw new Error("provider 502")
+      },
+    })
+    const { adapter, progress, context } = setup({ ui, client })
+
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(ui.selects).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(ui.toasts).toHaveLength(1)
+    expect(ui.toasts[0].variant).toBe("error")
+    expect(ui.toasts[0].message).not.toContain("502")
+    expect(client.calls.renames).toEqual([])
+    expect(client.calls.removes).toEqual(["ses_helper"])
+    expect(context.refreshes).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("reports an apply failure without a success toast, and releases the gate", async () => {
+    const ui = fakeUi({})
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      rename: () => {
+        throw new Error("write refused")
+      },
+    })
+    const { adapter, progress, context } = setup({ ui, client })
+
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(ui.selects).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(ui.toasts.some((toast) => toast.message === "Failed to update session title")).toBe(true)
+    expect(ui.toasts.some((toast) => toast.message.startsWith("New title"))).toBe(false)
+    expect(context.refreshes).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("rejects an auto run while an interactive run is in flight, exactly as the interactive path does", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({ select: ["run", "apply", true] })
+    const { adapter } = setup({ ui, client })
+
+    const first = openRetitle(ui, adapter, "")
+    await drainUntil(() => adapter.gate.running())
+
+    await openRetitleAuto(ui, adapter, "")
+
+    // Rejected before any work: the auto run neither creates a helper nor opens
+    // a progress lane, and the toast matches the interactive wording.
+    expect(ui.toasts.some((toast) => toast.message === "Retitle already running")).toBe(true)
+    expect(adapter.gate.running()).toBe(true)
+    expect(client.calls.creates).toHaveLength(0)
+
+    generation.resolve({ text: "Generated title" })
+    await first
+
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("rejects an interactive run while an auto run is in flight, and leaves its silent lane intact", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({ select: ["run", "apply", true] })
+    const { adapter, progress } = setup({ ui, client })
+
+    const first = openRetitleAuto(ui, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+
+    await openRetitle(ui, adapter, "")
+
+    // The shared gate rejects the interactive run: no dialog is opened, so the
+    // queued answers stay unused, and the auto run's surface stays untouched.
+    expect(ui.selects).toEqual([])
+    expect(ui.toasts.some((toast) => toast.message === "Retitle already running")).toBe(true)
+    expect(adapter.gate.running()).toBe(true)
+
+    generation.resolve({ text: "Generated title" })
+    await first
+
+    expect(progress.events).toEqual([])
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("rejects an auto run while another auto run is in flight, ensuring exactly one apply and no UI", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({})
+    const { adapter, progress } = setup({ ui, client })
+
+    let pending = 0
+    const deltas: Array<1 | -1> = []
+    const trackPending = (delta: 1 | -1) => {
+      deltas.push(delta)
+      pending += delta
+    }
+    const first = openRetitleAuto(ui, adapter, "", trackPending)
+    await drainUntil(() => client.calls.generates.length === 1)
+
+    const second = openRetitleAuto(ui, adapter, "", trackPending)
+    await second
+    expect(pending).toBe(1)
+    expect(deltas).toEqual([1])
+
+    // The second auto run is rejected: toast matches, no additional helper or generation
+    expect(ui.toasts.some((toast) => toast.message === "Retitle already running")).toBe(true)
+    expect(adapter.gate.running()).toBe(true)
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.generates).toHaveLength(1)
+
+    generation.resolve({ text: "Generated title" })
+    await first
+
+    expect(pending).toBe(0)
+    expect(deltas).toEqual([1, -1])
+    expect(client.calls.creates).toHaveLength(1)
+    expect(client.calls.generates).toHaveLength(1)
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(ui.selects).toEqual([])
+    expect(ui.prompts).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(progress.active()).toBeUndefined()
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("catches unexpected settings.read failure, emits log and toast, and cleans up gate", async () => {
+    const log = recordingLogger()
+    const ui = fakeUi({})
+    const { adapter, progress } = setup({ ui, logger: log.logger })
+
+    const brokenAdapter: RetitleAdapter = {
+      ...adapter,
+      settings: {
+        ...adapter.settings,
+        read: () => {
+          throw new Error("corrupted settings storage")
+        },
+      },
+    }
+
+    await openRetitleAuto(ui, brokenAdapter, "")
+
+    expect(adapter.gate.running()).toBe(false)
+    expect(ui.selects).toEqual([])
+    expect(ui.prompts).toEqual([])
+    expect(progress.events).toEqual([])
+    expect(ui.toasts).toEqual([
+      { variant: "error", message: "Retitle (auto) failed unexpectedly" },
+    ])
+    expect(log.events.some((event) => event.name === "auto-error")).toBe(true)
+  })
+
+  test("a failed auto run cleans up so the next invocation can run", async () => {
+    let now = 0
+    let call = 0
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => {
+        call += 1
+        if (call === 1) throw new Error("provider 502")
+        return { text: "Second title" }
+      },
+    })
+    const ui = fakeUi({})
+    const { adapter } = setup({ ui, client, now: () => now })
+
+    await openRetitleAuto(ui, adapter, "")
+    expect(client.calls.renames).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+
+    now += 5_000
+    await openRetitleAuto(ui, adapter, "")
+
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Second title" }])
+    expect(ui.selects).toEqual([])
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("tracks in-flight auto status count during execution and cleans up on settle", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({})
+    const { adapter } = setup({ ui, client })
+
+    let pending = 0
+    const deltas: Array<1 | -1> = []
+    const promise = openRetitleAuto(ui, adapter, "", (delta) => {
+      deltas.push(delta)
+      pending += delta
+    })
+    expect(pending).toBe(1)
+
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(pending).toBe(1)
+
+    generation.resolve({ text: "Async title" })
+    await promise
+
+    expect(pending).toBe(0)
+    expect(deltas).toEqual([1, -1])
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Async title" }])
+  })
+
+  for (const [label, error] of [
+    ["failure", new Error("generation error")],
+    ["timeout", new RetitleTimeoutError(45_000, "generate")],
+    ["cancellation", new DOMException("Generation cancelled", "AbortError")],
+  ] as const) {
+    test(`tracks in-flight auto status count drops back to 0 on ${label}`, async () => {
+      const generation = deferred<{ text: string }>()
+      const client = fakeClient({
+        list: () => ({ data: [userMessage("hello")], cursor: {} }),
+        generate: () => generation.promise,
+      })
+      const ui = fakeUi({})
+      const { adapter } = setup({ ui, client })
+
+      let pending = 0
+      const deltas: Array<1 | -1> = []
+      const promise = openRetitleAuto(ui, adapter, "", (delta) => {
+        deltas.push(delta)
+        pending += delta
+      })
+      await drainUntil(() => client.calls.generates.length === 1)
+      expect(client.calls.generates).toHaveLength(1)
+      expect(pending).toBe(1)
+
+      generation.reject(error)
+      await promise
+      expect(pending).toBe(0)
+      expect(deltas).toEqual([1, -1])
+      expect(adapter.gate.running()).toBe(false)
+      expect(client.calls.removes).toEqual(["ses_helper"])
+      expect(client.calls.renames).toEqual([])
+      expect(ui.toasts.some((toast) => toast.variant === "error")).toBe(true)
+    })
+  }
+
+  test("a throwing pending observer cannot interrupt auto work or cleanup", async () => {
+    const ui = fakeUi({})
+    const { adapter, client, progress } = setup({ ui })
+    const deltas: Array<1 | -1> = []
+
+    await openRetitleAuto(ui, adapter, "", (delta) => {
+      deltas.push(delta)
+      throw new Error("status observer failed")
+    })
+
+    expect(deltas).toEqual([1, -1])
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Generated title" }])
+    expect(adapter.gate.running()).toBe(false)
+    expect(progress.active()).toBeUndefined()
+  })
+
+  test("tracks in-flight status label for interactive /retitle and cleans up", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({ select: ["run", "apply", true] })
+    const { adapter } = setup({ ui, client })
+
+    let activeLabel: string | null = null
+    const runInteractive = async () => {
+      activeLabel = "/retitle"
+      try {
+        await openRetitle(ui, adapter, "")
+      } finally {
+        activeLabel = null
+      }
+    }
+
+    const promise = runInteractive()
+    expect(activeLabel).toBe("/retitle")
+
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(activeLabel).toBe("/retitle")
+
+    generation.resolve({ text: "Interactive title" })
+    await promise
+
+    expect(activeLabel).toBeNull()
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Interactive title" }])
   })
 })

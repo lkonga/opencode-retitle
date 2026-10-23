@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-// OpenCode V2 TUI entrypoint for /retitle.
+// OpenCode V2 TUI entrypoint for /retitle and /retitle-auto.
 //
 // This file is deliberately tiny: it mounts one component in the `app` slot and
 // registers one keymap layer. All behaviour lives in the modules it imports, so
@@ -14,44 +14,37 @@
 //
 // The V1 entrypoint (`../tui.ts`) is untouched and still loads under V1.
 
+import { createSignal, Show } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
 import { createRetitleAdapter, toRetitleContext } from "./adapter"
-import { retitleKeymapLayer } from "./command"
-import { openRetitle } from "./dialogs"
-import type { ProgressSurface } from "./progress"
+import { RETITLE_AUTO_SLASH_NAME, retitleKeymapLayer } from "./command"
+import { openRetitle, openRetitleAuto } from "./dialogs"
+import { observeContinuous } from "./continuous-observer"
 
-/**
- * Binds the render-free progress surface to the documented public dialog
- * lifecycle: `dialog.show(render)` renders, `dialog.clear()` dismisses.
- * `dialog.set(...)` is deliberately not used — it carries presentation options
- * (`{ size, centered }`), not content (`packages/plugin/src/tui/context.ts:341`).
- * Both calls are guarded so a runtime revision that stops publishing the dialog
- * degrades to "no progress" instead of failing the run; `progress.ts` owns the
- * lifetime and the token safety.
- */
-function dialogProgressSurface(dialog: Plugin.Context["ui"]["dialog"] | undefined): ProgressSurface {
-  return {
-    set(message) {
-      if (!dialog || typeof dialog.show !== "function") return
-      dialog.show(() => (
-        <box paddingLeft={2} paddingRight={2}>
-          <text>{message}</text>
-        </box>
-      ))
-    },
-    clear() {
-      if (!dialog || typeof dialog.clear !== "function") return
-      dialog.clear()
-    },
-  }
-}
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-function Commands(props: { context: Plugin.Context; adapter: ReturnType<typeof createRetitleAdapter> }) {
+function Commands(props: {
+  context: Plugin.Context
+  adapter: ReturnType<typeof createRetitleAdapter>
+  onAutoPendingChange: (delta: 1 | -1) => void
+  onInteractivePendingChange: (delta: 1 | -1) => void
+  onCandidatesChange: () => void
+}) {
+  observeContinuous(props.context, props.adapter,
+    (adapter) => openRetitleAuto(props.context, adapter, undefined, props.onAutoPendingChange), props.onCandidatesChange)
   // `keymap.layer` is scoped to this component, so the layer is registered
   // exactly once per activation and is disposed with the plugin.
   props.context.keymap.layer(() =>
     retitleKeymapLayer(
-      (rawArgs) => openRetitle(props.context, props.adapter, rawArgs),
+      async (rawArgs) => {
+        props.onInteractivePendingChange(1)
+        try {
+          await openRetitle(props.context, props.adapter, rawArgs)
+        } finally {
+          props.onInteractivePendingChange(-1)
+        }
+      },
+      (rawArgs) => openRetitleAuto(props.context, props.adapter, rawArgs, props.onAutoPendingChange),
       (error) => props.adapter.logger.event("command-error", { error }),
     ),
   )
@@ -67,9 +60,49 @@ export default Plugin.define({
     // through public context APIs. Building it here (not inside the component)
     // keeps a single gate and a single progress lane even if the slot
     // re-renders.
-    const adapter = createRetitleAdapter(toRetitleContext(context), {
-      progressSurface: dialogProgressSurface(context.ui?.dialog),
+    // Progress is shown only by the animated footer status, never a modal.
+    const adapter = createRetitleAdapter(toRetitleContext(context))
+
+    const [pendingAuto, setPendingAuto] = createSignal(0)
+    const [pendingInteractive, setPendingInteractive] = createSignal(0)
+    const [candidateVersion, setCandidateVersion] = createSignal(0)
+    const proposedCount = () => {
+      candidateVersion()
+      const route = context.ui.router.current()
+      return route.type === "session" ? adapter.candidates?.pending(route.sessionID).length ?? 0 : 0
+    }
+
+    // Auto status follows granted runs, and takes priority over rejected commands.
+    context.ui.slot({
+      append: "prompt.footer.status",
+      render: () => {
+        return (
+          <>
+          <Show when={pendingAuto() > 0 || pendingInteractive() > 0}>
+              <box flexShrink={0} flexDirection="row" gap={1}>
+                <spinner frames={SPINNER_FRAMES} interval={80} />
+                <text>{pendingAuto() > 0 ? `/${RETITLE_AUTO_SLASH_NAME}` : "/retitle"}</text>
+              </box>
+          </Show>
+          <Show when={pendingAuto() === 0 && pendingInteractive() === 0 && proposedCount() > 0}>
+            <text>{`⋯ ${proposedCount()} title${proposedCount() === 1 ? "" : "s"} proposed`}</text>
+          </Show>
+          </>
+        )
+      },
     })
-    return context.ui.slot({ append: "app", render: () => <Commands context={context} adapter={adapter} /> })
+
+    return context.ui.slot({
+      append: "app",
+      render: () => (
+        <Commands
+          context={context}
+          adapter={adapter}
+          onAutoPendingChange={(delta) => setPendingAuto((n) => Math.max(0, n + delta))}
+          onInteractivePendingChange={(delta) => setPendingInteractive((n) => Math.max(0, n + delta))}
+          onCandidatesChange={() => setCandidateVersion((n) => n + 1)}
+        />
+      ),
+    })
   },
 })
