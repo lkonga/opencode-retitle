@@ -44,6 +44,27 @@ See [`v2/README.md`](./v2/README.md) for architecture details, public API audit,
 
 ---
 
+## [WIP] Continuous Semantic Retitling & Shadow Queue
+
+Currently in active development on branch [`wt/v2-production/feat/continuous-retitle`](https://github.com/lkonga/opencode-retitle/tree/wt/v2-production/feat/continuous-retitle) (207 passing tests):
+
+Continuous background session retitling transforms session naming from a manual action into an autonomous, non-intrusive background capability:
+
+- **Semantic Topic-Drift Detection (`drift.ts`)**:
+  - Monitors conversation turns in real-time as the user prompts.
+  - Employs a tokenless lexical keyword coverage algorithm with noun stemming (`nounStem`) and stop-word filtering across sliding turn windows.
+  - When sustained low topic coverage (<30% threshold over confirmed checks) indicates that the conversation has pivoted (e.g. from *frontend styling* to *docker networking*), it flags drift without spurious renames.
+- **Shadow Mode & Title Candidate Queue (`shadow.ts`)**:
+  - **Direct auto-apply mode**: Automatically renames the session in the background when drift or cadence triggers.
+  - **Shadow queue mode**: Instead of mutating the session title directly, candidate titles are staged into a FIFO shadow queue (`title-candidates` in durable plugin storage).
+  - Users can review queued suggestions on demand (`/retitle` -> *Review Queued Titles*), inspect before/after diffs (`Previous Title → Proposed Title`), edit, accept, or reject candidates.
+- **Smart Manual Protection**:
+  - Respects manual renames (`respectManualRename`): if a user explicitly renamed the session by hand, continuous retitling pauses automatically to prevent overwriting user intent.
+- **Durable Turn Claims**:
+  - Uses transactional claims (`claimEvaluation`) to guarantee background evaluations never double-run or race across turns.
+
+---
+
 ## OpenCode V1 (Legacy)
 
 The repository root contains the legacy V1 plugin for OpenCode v1.17.7+.
