@@ -5,12 +5,8 @@ V2 TUI implementation of `/retitle` (issue
 deferred [#226](https://github.com/lkonga/opencode-patches/issues/226)): regenerate
 the current session's title from a bounded sample of its conversation, on demand.
 
-* V2 only — this directory is a separate package (`opencode-retitle-v2`) and
-  nothing here loads under V1.
-* V1 is untouched byte-for-byte: `../tui.ts`, `../package.json` and `../README.md`
-  are unchanged, and `v2/test/tui-contract.test.ts` pins their hashes. The
-  repository-root README documents the **V1** plugin; its `tui.json`
-  installation instructions do not apply to V2.
+* V2 only — this directory is a separate package (`opencode-retitle-v2`) on branch **`v2-production`** and nothing here loads under V1.
+* V1 code is isolated: `../tui.ts` and `../package.json` are unchanged, and `v2/test/tui-contract.test.ts` pins their hashes. The repository-root README introduces both V1 and V2.
 * Native audit (what the runtime already does, what it does not, and which
   public APIs `/retitle` reuses): [`NATIVE-AUDIT.md`](./NATIVE-AUDIT.md).
 
@@ -18,9 +14,9 @@ the current session's title from a bounded sample of its conversation, on demand
 
 | File | Purpose |
 |---|---|
-| `tui.tsx` | V2 TUI entrypoint. One `app` slot claim, one keymap layer. No logic. |
-| `command.ts` | The single `/retitle` command (palette + slash + the fixed `ctrl+shift+r` binding in one registration) and the `mode: "global"` layer factory. |
-| `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply. |
+| `tui.tsx` | V2 TUI entrypoint. App slot claim, keymap layer, and animated footer spinner status. |
+| `command.ts` | The `/retitle` and `/retitle-auto` commands (palette + slash + the fixed `ctrl+shift+r` binding for interactive) and the `mode: "global"` layer factory. |
+| `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply, plus `openRetitleAuto` for unattended execution. |
 | `runner.ts` | Pure pipeline over injected ports: sample → model → native generation → clean title. |
 | `progress.ts` | Run-scoped generation/apply progress: token-safe set/clear lifecycle over a public `{ set(message), clear() }` surface. |
 | `adapter.ts` | The only module that knows `Plugin.Context`; wires context → ports, settings, gate, logger. |
@@ -67,10 +63,12 @@ the current session's title from a bounded sample of its conversation, on demand
 dialog options can also be seeded from the command line:
 
 ```
-/retitle                                    # retitle from recent messages
-/retitle deployment pipeline                # steering hint
+/retitle                                    # retitle from recent messages (interactive settings & confirmation)
+/retitle deployment pipeline                # with steering hint
 /retitle --samples 20 --from 50             # sample 20 turns from the 50% point
 /retitle --offset 30 --samples 15 docker    # last 30 messages, 15 samples, hint
+/retitle-auto                               # unattended: uses current settings & auto-applies title without dialogs
+/retitle-auto quick fix                     # unattended with steering hint
 ```
 
 | Flag | Default | Range | Meaning |
