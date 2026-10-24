@@ -30,7 +30,13 @@ OpenCode V2 implementation lives in `./v2`.
 
 ### Installation (V2)
 
-Add to your `cli.json` plugin array:
+Install directly via the OpenCode CLI:
+
+```bash
+opencode plugin add github:lkonga/opencode-retitle
+```
+
+Or configure manually in your `cli.json` plugin array:
 
 ```json
 {
