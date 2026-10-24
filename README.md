@@ -6,8 +6,6 @@ TUI plugin for [OpenCode](https://opencode.ai) that adds a `/retitle` slash comm
 > OpenCode V2 is supported on the **`v2-production`** branch (located in the `./v2` subdirectory).  
 > It provides both interactive `/retitle` (`ctrl+shift+r`) and unattended `/retitle-auto` (with no pop-up dialogs and a `/btw`-style footer spinner). See [`v2/README.md`](./v2/README.md) for full V2 details and installation in `cli.json`.
 
-Ported from the [VS Code Copilot Chat](https://github.com/microsoft/vscode-copilot-chat) fork's `/retitle` command.
-
 ## How it works
 
 1. Samples recent conversation turns (tail-3 + spread sampling)
