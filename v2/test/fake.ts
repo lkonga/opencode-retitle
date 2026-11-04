@@ -5,7 +5,7 @@
 // lifecycle can be driven end to end without a TUI.
 
 import type { SessionApiClient } from "../session-api"
-import type { SettingsStorage } from "../settings"
+import { SETTINGS_KEY, type SettingsStorage } from "../settings"
 import type { RetitleContext } from "../adapter"
 import type { ProgressSurface } from "../progress"
 import type { DialogApi, RetitleUiContext, SelectOption, ToastApi, ToastVariant } from "../dialogs"
@@ -96,24 +96,34 @@ export function fakeClient(options: FakeClientOptions = {}) {
 
 export function fakeStorage(initial: Record<string, unknown> = {}) {
   const writes: Array<Record<string, unknown>> = []
-  const state: Record<string, unknown> = { ...initial }
+  const settingsState: Record<string, unknown> = { ...initial }
+  const stores = new Map<string, Record<string, unknown>>()
+  stores.set(SETTINGS_KEY, settingsState)
+
   const storage: SettingsStorage = {
-    store<Value extends object>(_key: string, options: { readonly initial: Value }) {
-      for (const [key, value] of Object.entries(options.initial)) {
-        if (!(key in state)) state[key] = value
+    store<Value extends object>(key: string, options: { readonly initial: Value }) {
+      let state = stores.get(key)
+      if (!state) {
+        state = {}
+        stores.set(key, state)
+      }
+      for (const [k, value] of Object.entries(options.initial)) {
+        if (!(k in state)) state[k] = value
       }
       const store = state as Value
       const update = (mutation: (draft: Value) => void) => {
         const draft = { ...(state as Value) }
         mutation(draft)
         Object.assign(state, draft)
-        writes.push({ ...(draft as Record<string, unknown>) })
+        if (key === SETTINGS_KEY) {
+          writes.push({ ...(draft as Record<string, unknown>) })
+        }
         return Promise.resolve()
       }
       return [store, update] as const
     },
   }
-  return { storage, writes, state }
+  return { storage, writes, state: settingsState }
 }
 
 export type CatalogOptions = {

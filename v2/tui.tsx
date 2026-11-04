@@ -19,6 +19,7 @@ import { Plugin } from "@opencode/plugin/tui"
 import { createRetitleAdapter, toRetitleContext } from "./adapter"
 import { RETITLE_AUTO_SLASH_NAME, retitleKeymapLayer } from "./command"
 import { openRetitle, openRetitleAuto } from "./dialogs"
+import { observeContinuous } from "./continuous-observer"
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -27,7 +28,10 @@ function Commands(props: {
   adapter: ReturnType<typeof createRetitleAdapter>
   onAutoPendingChange: (delta: 1 | -1) => void
   onInteractivePendingChange: (delta: 1 | -1) => void
+  onCandidatesChange: () => void
 }) {
+  observeContinuous(props.context, props.adapter,
+    (adapter) => openRetitleAuto(props.context, adapter, undefined, props.onAutoPendingChange), props.onCandidatesChange)
   // `keymap.layer` is scoped to this component, so the layer is registered
   // exactly once per activation and is disposed with the plugin.
   props.context.keymap.layer(() =>
@@ -61,18 +65,29 @@ export default Plugin.define({
 
     const [pendingAuto, setPendingAuto] = createSignal(0)
     const [pendingInteractive, setPendingInteractive] = createSignal(0)
+    const [candidateVersion, setCandidateVersion] = createSignal(0)
+    const proposedCount = () => {
+      candidateVersion()
+      const route = context.ui.router.current()
+      return route.type === "session" ? adapter.candidates?.pending(route.sessionID).length ?? 0 : 0
+    }
 
     // Auto status follows granted runs, and takes priority over rejected commands.
     context.ui.slot({
       append: "prompt.footer.status",
       render: () => {
         return (
+          <>
           <Show when={pendingAuto() > 0 || pendingInteractive() > 0}>
               <box flexShrink={0} flexDirection="row" gap={1}>
                 <spinner frames={SPINNER_FRAMES} interval={80} />
                 <text>{pendingAuto() > 0 ? `/${RETITLE_AUTO_SLASH_NAME}` : "/retitle"}</text>
               </box>
           </Show>
+          <Show when={pendingAuto() === 0 && pendingInteractive() === 0 && proposedCount() > 0}>
+            <text>{`⋯ ${proposedCount()} title${proposedCount() === 1 ? "" : "s"} proposed`}</text>
+          </Show>
+          </>
         )
       },
     })
@@ -85,6 +100,7 @@ export default Plugin.define({
           adapter={adapter}
           onAutoPendingChange={(delta) => setPendingAuto((n) => Math.max(0, n + delta))}
           onInteractivePendingChange={(delta) => setPendingInteractive((n) => Math.max(0, n + delta))}
+          onCandidatesChange={() => setCandidateVersion((n) => n + 1)}
         />
       ),
     })

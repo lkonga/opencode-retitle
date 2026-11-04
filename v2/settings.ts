@@ -18,9 +18,11 @@ import {
 } from "./retitle-core"
 
 export const SETTINGS_KEY = "settings"
+import { readContinuous, type RetitleContinuousSettings } from "./continuous-settings"
 
 export type RetitlePersisted = {
   readonly model: string
+  readonly continuous?: RetitleContinuousSettings
 }
 
 /** Structural view of `Plugin.Context.storage` — only what retitle persists. */
@@ -34,6 +36,7 @@ export interface SettingsStorage {
 export interface SettingsStore {
   read(): RetitlePersisted
   setModel(model: string): Promise<void>
+  setContinuous?(settings: RetitleContinuousSettings): Promise<void>
 }
 
 export function initialSettings(): RetitlePersisted {
@@ -44,7 +47,9 @@ export function initialSettings(): RetitlePersisted {
 export function readPersisted(value: unknown): RetitlePersisted {
   if (!value || typeof value !== "object") return initialSettings()
   const model = (value as { readonly model?: unknown }).model
-  return { model: typeof model === "string" ? model.trim() : "" }
+  const continuous = (value as { continuous?: unknown }).continuous
+  return { model: typeof model === "string" ? model.trim() : "",
+    ...(continuous === undefined ? {} : { continuous: readContinuous(continuous) }) }
 }
 
 export function createSettingsStore(storage: SettingsStorage): SettingsStore {
@@ -52,6 +57,7 @@ export function createSettingsStore(storage: SettingsStorage): SettingsStore {
   return {
     read: () => readPersisted(store),
     setModel: (model) => update((draft) => void (draft.model = model.trim())),
+    setContinuous: (settings) => update((draft) => void (draft.continuous = readContinuous(settings))),
   }
 }
 
