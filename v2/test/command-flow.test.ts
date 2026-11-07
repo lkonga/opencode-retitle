@@ -1287,4 +1287,127 @@ describe("auto lifecycle (/retitle-auto)", () => {
     expect(adapter.gate.running("ses_2")).toBe(false)
     expect(adapter.gate.running()).toBe(false)
   })
+
+  test("explicitly covers same-ID interactive/auto in both orders", async () => {
+    const interactiveGen = deferred<{ text: string }>()
+    const autoGen = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: () => ({ data: [userMessage("hello")], cursor: {} }),
+      generate: (input) => {
+        if (input.prompt.includes("interactive")) return interactiveGen.promise
+        return autoGen.promise
+      },
+    })
+    const ui = fakeUi({ sessionID: "ses_same", select: ["run", "apply", true] })
+    let now = 10_000
+    const { adapter } = setup({ ui, client, now: () => now })
+
+    // Order 1: Interactive in flight -> Auto rejected
+    const pInteractive = openRetitle(ui, adapter, "interactive")
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(adapter.gate.running("ses_same")).toBe(true)
+
+    await openRetitleAuto(ui, adapter, "")
+    expect(ui.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(1)
+
+    interactiveGen.resolve({ text: "Interactive Same Title" })
+    await pInteractive
+    expect(adapter.gate.running("ses_same")).toBe(false)
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_same", title: "Interactive Same Title" }])
+
+    // Advance past debounce windows
+    now += 20 * 60 * 1000
+
+    // Order 2: Auto in flight -> Interactive rejected
+    const pAuto = openRetitleAuto(ui, adapter, "auto")
+    await drainUntil(() => client.calls.generates.length === 2)
+    expect(adapter.gate.running("ses_same")).toBe(true)
+
+    await openRetitle(ui, adapter, "")
+    expect(ui.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(2)
+
+    autoGen.resolve({ text: "Auto Same Title" })
+    await pAuto
+    expect(adapter.gate.running("ses_same")).toBe(false)
+    expect(client.calls.renames).toEqual([
+      { sessionID: "ses_same", title: "Interactive Same Title" },
+      { sessionID: "ses_same", title: "Auto Same Title" },
+    ])
+  })
+
+  test("rejects a second interactive dialog across different sessions to prevent modal collision, while allowing concurrent auto", async () => {
+    const gen1 = deferred<{ text: string }>()
+    const genAuto = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({ data: [userMessage(`hello in ${input.sessionID}`)], cursor: {} }),
+      generate: (input) => {
+        if (input.prompt.includes("ses_1")) return gen1.promise
+        return genAuto.promise
+      },
+    })
+    const ui1 = fakeUi({ sessionID: "ses_1", select: ["run", "apply", true] })
+    const ui2 = fakeUi({ sessionID: "ses_2", select: ["run", "apply", true] })
+    const ui3 = fakeUi({ sessionID: "ses_3" })
+    const { adapter } = setup({ ui: ui1, client })
+
+    // Session 1 opens interactive dialog
+    const p1 = openRetitle(ui1, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(adapter.gate.running("ses_1")).toBe(true)
+
+    // Session 2 attempts interactive dialog: must be rejected to prevent modal collision!
+    await openRetitle(ui2, adapter, "")
+    expect(ui2.toasts.some((t) => t.message === "Retitle already running")).toBe(true)
+    expect(adapter.gate.running("ses_2")).toBe(false)
+
+    // But Session 3 auto run does NOT use modal dialog: runs concurrently!
+    const p3 = openRetitleAuto(ui3, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 2)
+    expect(adapter.gate.running("ses_3")).toBe(true)
+
+    // Resolve both in-flight runs
+    gen1.resolve({ text: "Interactive Title 1" })
+    genAuto.resolve({ text: "Auto Title 3" })
+    await Promise.all([p1, p3])
+
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_1", title: "Interactive Title 1" })
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_3", title: "Auto Title 3" })
+    expect(adapter.gate.running()).toBe(false)
+  })
+
+  test("cancellation in one session cleans up without affecting a concurrent in-flight session", async () => {
+    const genAuto = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({ data: [userMessage(`msg in ${input.sessionID}`)], cursor: {} }),
+      generate: (input) => {
+        if (input.prompt.includes("ses_auto")) return genAuto.promise
+        return { text: "Candidate Title" }
+      },
+    })
+    // uiInteractive will discard the candidate title
+    const uiInteractive = fakeUi({ sessionID: "ses_interactive", select: ["run", "cancel", true] })
+    const uiAuto = fakeUi({ sessionID: "ses_auto" })
+    const { adapter } = setup({ ui: uiInteractive, client })
+
+    // Start auto run on ses_auto (deferred)
+    const pAuto = openRetitleAuto(uiAuto, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(adapter.gate.running("ses_auto")).toBe(true)
+
+    // Run interactive on ses_interactive and cancel/discard it
+    await openRetitle(uiInteractive, adapter, "")
+    expect(adapter.gate.running("ses_interactive")).toBe(false)
+    // Cancelled interactive wrote nothing
+    expect(client.calls.renames.filter((r) => r.sessionID === "ses_interactive")).toHaveLength(0)
+
+    // ses_auto is still running!
+    expect(adapter.gate.running("ses_auto")).toBe(true)
+
+    // Settle ses_auto
+    genAuto.resolve({ text: "Auto Succeeded" })
+    await pAuto
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_auto", title: "Auto Succeeded" })
+    expect(adapter.gate.running("ses_auto")).toBe(false)
+    expect(adapter.gate.running()).toBe(false)
+  })
 })

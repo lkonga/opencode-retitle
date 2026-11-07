@@ -99,6 +99,29 @@ describe("createRunGate", () => {
     now += 500
     expect(gate.begin("ses_1").ok).toBe(true)
   })
+
+  test("prevents concurrent interactive claims across different sessions to protect modal surface", () => {
+    const gate = createRunGate({ debounceMs: 0 })
+    const interactive1 = gate.begin("ses_1", { interactive: true })
+    expect(interactive1.ok).toBe(true)
+
+    // Second interactive claim for a different session is rejected (modal collision protection)
+    const interactive2 = gate.begin("ses_2", { interactive: true })
+    expect(interactive2).toEqual({ ok: false, reason: "in-flight" })
+
+    // Auto claim for different session is allowed (preserves auto concurrency)
+    const auto2 = gate.begin("ses_2", { interactive: false })
+    expect(auto2.ok).toBe(true)
+
+    // Auto claim for third session is also allowed concurrently
+    const auto3 = gate.begin("ses_3")
+    expect(auto3.ok).toBe(true)
+
+    // Releasing interactive1 allows new interactive claim
+    if (interactive1.ok) gate.end(interactive1.token)
+    const interactive3 = gate.begin("ses_4", { interactive: true })
+    expect(interactive3.ok).toBe(true)
+  })
 })
 
 describe("createDebouncer", () => {
