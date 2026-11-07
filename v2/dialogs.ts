@@ -345,7 +345,13 @@ async function handleOutcome(
   }
   if (outcome.status === "empty") {
     adapter.logger.event("outcome-empty", { sessionID, messageCount: outcome.messageCount })
-    toast(context, adapter, "empty", "warning", "Nothing to retitle yet: this session has no user turns to sample")
+    toast(
+      context,
+      adapter,
+      `empty:${sessionID}`,
+      "warning",
+      "Nothing to retitle yet: this session has no user turns to sample",
+    )
     return "done"
   }
   if (outcome.status === "no-title") {
@@ -354,14 +360,14 @@ async function handleOutcome(
     toast(
       context,
       adapter,
-      `no-title:${label}`,
+      `no-title:${sessionID}:${label}`,
       "warning",
       `No title came back from ${label}. Pick another model in settings.`,
     )
     return "reopen"
   }
   adapter.logger.event("outcome-error", { sessionID, code: outcome.code })
-  toast(context, adapter, `error:${outcome.code}`, "error", outcome.message)
+  toast(context, adapter, `error:${sessionID}:${outcome.code}`, "error", outcome.message)
   return "reopen"
 }
 
