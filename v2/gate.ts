@@ -14,7 +14,7 @@ export type GateDenial = { readonly ok: false; readonly reason: GateRejection }
 export type GateResult = GateGrant | GateDenial
 
 export interface RunGate {
-  begin(sessionID?: string): GateResult
+  begin(sessionID?: string, options?: { readonly interactive?: boolean }): GateResult
   /** Releases the slot. A token that is not current is ignored. */
   end(token: symbol): void
   /** True while a run holds the slot. */
@@ -42,10 +42,13 @@ export function createRunGate(options: GateOptions = {}): RunGate {
   const sessionByToken = new Map<symbol, string>()
   const lastBeginAtBySession = new Map<string, number>()
   let lastBeginAtGlobal = Number.NEGATIVE_INFINITY
+  let activeInteractiveToken: symbol | undefined
 
   return {
-    begin(sessionID?: string) {
+    begin(sessionID?: string, runOptions?: { readonly interactive?: boolean }) {
       const key = sessionID ?? ""
+      const isInteractive = runOptions?.interactive === true
+
       if (sessionID !== undefined) {
         if (currentBySession.has(key)) return { ok: false, reason: "in-flight" }
         const lastBeginAt = lastBeginAtBySession.get(key) ?? Number.NEGATIVE_INFINITY
@@ -54,11 +57,19 @@ export function createRunGate(options: GateOptions = {}): RunGate {
         if (currentBySession.size > 0) return { ok: false, reason: "in-flight" }
         if (now() - lastBeginAtGlobal < debounceMs) return { ok: false, reason: "debounced" }
       }
+
+      if (isInteractive && activeInteractiveToken !== undefined) {
+        return { ok: false, reason: "in-flight" }
+      }
+
       const token = Symbol("retitle-run")
       currentBySession.set(key, token)
       sessionByToken.set(token, key)
       lastBeginAtBySession.set(key, now())
       lastBeginAtGlobal = now()
+      if (isInteractive) {
+        activeInteractiveToken = token
+      }
       return { ok: true, token }
     },
     end(token) {
@@ -67,6 +78,9 @@ export function createRunGate(options: GateOptions = {}): RunGate {
       if (currentBySession.get(key) !== token) return
       currentBySession.delete(key)
       sessionByToken.delete(token)
+      if (activeInteractiveToken === token) {
+        activeInteractiveToken = undefined
+      }
     },
     running(sessionID?: string) {
       if (sessionID !== undefined) {

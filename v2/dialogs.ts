@@ -114,7 +114,7 @@ export async function openRetitle(
     return
   }
 
-  const grant = claimRun(context, adapter, sessionID)
+  const grant = claimRun(context, adapter, sessionID, { interactive: true })
   if (!grant) return
 
   // Only a granted run owns a progress lane, so a denied duplicate invocation
@@ -151,7 +151,7 @@ export async function openRetitleAuto(
     return
   }
 
-  const grant = claimRun(context, adapter, sessionID)
+  const grant = claimRun(context, adapter, sessionID, { interactive: false })
   if (!grant) return
 
   // `silent` keeps the run's lane and its progress logs but suppresses surface
@@ -207,8 +207,13 @@ export async function openRetitleAuto(
  * auto runs go through the same helper, so each rejects the other with the same
  * log event and the same toast.
  */
-function claimRun(context: RetitleUiContext, adapter: RetitleAdapter, sessionID: string): GateGrant | undefined {
-  const grant = adapter.gate.begin(sessionID)
+function claimRun(
+  context: RetitleUiContext,
+  adapter: RetitleAdapter,
+  sessionID: string,
+  options?: { readonly interactive?: boolean },
+): GateGrant | undefined {
+  const grant = adapter.gate.begin(sessionID, options)
   if (grant.ok) return grant
   adapter.logger.event("rejected", { sessionID, reason: grant.reason })
   if (grant.reason === "in-flight") toast(context, adapter, `in-flight:${sessionID}`, "warning", IN_FLIGHT_MESSAGE)
