@@ -1125,4 +1125,166 @@ describe("auto lifecycle (/retitle-auto)", () => {
     expect(activeLabel).toBeNull()
     expect(client.calls.renames).toEqual([{ sessionID: "ses_current", title: "Interactive title" }])
   })
+
+  test("runs concurrent /retitle-auto for TWO distinct main sessions with overlapping generation", async () => {
+    const gen1 = deferred<{ text: string }>()
+    const gen2 = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({
+        data: [userMessage(`hello in ${input.sessionID}`)],
+        cursor: {},
+      }),
+      generate: (input) => {
+        if (input.prompt.includes("ses_1")) return gen1.promise
+        return gen2.promise
+      },
+    })
+    const ui1 = fakeUi({ sessionID: "ses_1" })
+    const ui2 = fakeUi({ sessionID: "ses_2" })
+    const { adapter } = setup({ ui: ui1, client })
+
+    let pending = 0
+    const deltas: Array<1 | -1> = []
+    const trackPending = (delta: 1 | -1) => {
+      deltas.push(delta)
+      pending += delta
+    }
+
+    const p1 = openRetitleAuto(ui1, adapter, "", trackPending)
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(pending).toBe(1)
+    expect(adapter.gate.running("ses_1")).toBe(true)
+    expect(adapter.gate.running("ses_2")).toBe(false)
+
+    // Second distinct session starts while first is in-flight:
+    const p2 = openRetitleAuto(ui2, adapter, "", trackPending)
+    await drainUntil(() => client.calls.generates.length === 2)
+    expect(pending).toBe(2)
+    expect(adapter.gate.running("ses_1")).toBe(true)
+    expect(adapter.gate.running("ses_2")).toBe(true)
+
+    // Neither is rejected! No error or in-flight toasts
+    expect(ui1.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(0)
+    expect(ui2.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(0)
+
+    // Resolve first generation
+    gen1.resolve({ text: "Title 1" })
+    await p1
+    expect(pending).toBe(1)
+    expect(adapter.gate.running("ses_1")).toBe(false)
+    expect(adapter.gate.running("ses_2")).toBe(true)
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_1", title: "Title 1" })
+    expect(ui1.toasts.some((t) => t.variant === "success" && t.message === "New title: Title 1")).toBe(true)
+
+    // Resolve second generation
+    gen2.resolve({ text: "Title 2" })
+    await p2
+    expect(pending).toBe(0)
+    expect(adapter.gate.running("ses_2")).toBe(false)
+    expect(adapter.gate.running()).toBe(false)
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_2", title: "Title 2" })
+    expect(ui2.toasts.some((t) => t.variant === "success" && t.message === "New title: Title 2")).toBe(true)
+  })
+
+  test("rejects same-ID duplicate while distinct session runs concurrently", async () => {
+    const gen1 = deferred<{ text: string }>()
+    const gen2 = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({ data: [userMessage(`msg in ${input.sessionID}`)], cursor: {} }),
+      generate: (input) => (input.prompt.includes("ses_1") ? gen1.promise : gen2.promise),
+    })
+    const ui1 = fakeUi({ sessionID: "ses_1", select: ["run", "apply", true] })
+    const ui2 = fakeUi({ sessionID: "ses_2" })
+    const { adapter } = setup({ ui: ui1, client })
+
+    // Start auto run on ses_1
+    const p1 = openRetitleAuto(ui1, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+
+    // Same-ID duplicate on ses_1 (interactive or auto) is rejected!
+    await openRetitle(ui1, adapter, "")
+    await openRetitleAuto(ui1, adapter, "")
+    expect(ui1.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(1)
+
+    // But distinct session ses_2 runs concurrently!
+    const p2 = openRetitleAuto(ui2, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 2)
+    expect(ui2.toasts.filter((t) => t.message === "Retitle already running")).toHaveLength(0)
+
+    gen1.resolve({ text: "Title 1" })
+    gen2.resolve({ text: "Title 2" })
+    await Promise.all([p1, p2])
+    expect(client.calls.renames).toHaveLength(2)
+  })
+
+  test("captures destination session and applies title to it even after navigation, with audit toast", async () => {
+    const generation = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({ data: [userMessage(`msg in ${input.sessionID}`)], cursor: {} }),
+      generate: () => generation.promise,
+    })
+    const ui = fakeUi({ sessionID: "ses_source" })
+    const { adapter } = setup({ ui, client })
+
+    // Start auto on ses_source
+    const promise = openRetitleAuto(ui, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+
+    // User navigates to a different session while generation is deferred
+    ui.setRoute({ type: "session", sessionID: "ses_other" })
+
+    // Settle generation
+    generation.resolve({ text: "Destination title" })
+    await promise
+
+    // Applied to the captured destination (ses_source), NOT the navigated session (ses_other)
+    expect(client.calls.renames).toEqual([{ sessionID: "ses_source", title: "Destination title" }])
+    expect(ui.toasts.some((t) => t.variant === "success" && t.message === "New title: Destination title")).toBe(true)
+    expect(adapter.gate.running("ses_source")).toBe(false)
+  })
+
+  test("failure in one lane cleans up and allows retry without affecting concurrent lane", async () => {
+    let call1 = 0
+    const gen2 = deferred<{ text: string }>()
+    const client = fakeClient({
+      list: (input) => ({ data: [userMessage(`hello in ${input.sessionID}`)], cursor: {} }),
+      generate: (input) => {
+        if (input.prompt.includes("ses_1")) {
+          call1++
+          if (call1 === 1) throw new Error("provider 502")
+          return { text: "Retry title 1" }
+        }
+        return gen2.promise
+      },
+    })
+    const ui1 = fakeUi({ sessionID: "ses_1" })
+    const ui2 = fakeUi({ sessionID: "ses_2" })
+    let now = 10_000
+    const { adapter } = setup({ ui: ui1, client, now: () => now })
+
+    // Start ses_2 first (deferred)
+    const p2 = openRetitleAuto(ui2, adapter, "")
+    await drainUntil(() => client.calls.generates.length === 1)
+    expect(adapter.gate.running("ses_2")).toBe(true)
+
+    // ses_1 fails
+    await openRetitleAuto(ui1, adapter, "")
+    expect(ui1.toasts.some((t) => t.variant === "error")).toBe(true)
+    expect(adapter.gate.running("ses_1")).toBe(false)
+    expect(adapter.gate.running("ses_2")).toBe(true) // ses_2 still running!
+
+    // Retry ses_1 after failure debounce window
+    now += 5_000
+    await openRetitleAuto(ui1, adapter, "")
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_1", title: "Retry title 1" })
+    expect(adapter.gate.running("ses_1")).toBe(false)
+    expect(adapter.gate.running("ses_2")).toBe(true)
+
+    // Settle ses_2
+    gen2.resolve({ text: "Title 2" })
+    await p2
+    expect(client.calls.renames).toContainEqual({ sessionID: "ses_2", title: "Title 2" })
+    expect(adapter.gate.running("ses_2")).toBe(false)
+    expect(adapter.gate.running()).toBe(false)
+  })
 })
