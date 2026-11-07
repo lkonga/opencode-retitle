@@ -62,7 +62,7 @@ export interface ProgressController {
    * Opens a progress lane for one granted run. A rejected invocation never
    * reaches this point, so it cannot touch another run's progress.
    */
-  run(options?: { readonly silent?: boolean }): ProgressRun
+  run(options?: { readonly silent?: boolean; readonly sessionID?: string }): ProgressRun
   /** True while a surface is up. Diagnostics and tests only. */
   readonly active: boolean
 }
@@ -71,14 +71,24 @@ export function createProgressController(
   surface: ProgressSurface | undefined,
   logger?: RetitleLogger,
 ): ProgressController {
-  type Entry = { readonly owner: symbol; readonly token: symbol; readonly stage: ProgressStage; readonly silent: boolean }
-  let current: Entry | undefined
+  type Entry = {
+    readonly owner: symbol
+    readonly token: symbol
+    readonly stage: ProgressStage
+    readonly silent: boolean
+    readonly sessionID?: string
+  }
+  const entriesByOwner = new Map<symbol, Entry>()
+  let surfaceOwner: symbol | undefined
 
-  /** Drops `entry` if it is still the current one; idempotent by construction. */
+  /** Drops `entry` if it is still the current one for its owner; idempotent by construction. */
   const dismiss = (entry: Entry): void => {
-    if (current?.token !== entry.token) return
-    current = undefined
-    if (!entry.silent) contain(() => surface?.clear(), logger, "progress-clear-error")
+    if (entriesByOwner.get(entry.owner)?.token !== entry.token) return
+    entriesByOwner.delete(entry.owner)
+    if (!entry.silent && surfaceOwner === entry.owner) {
+      surfaceOwner = undefined
+      contain(() => surface?.clear(), logger, "progress-clear-error")
+    }
     logger?.event("progress-cleared", { stage: entry.stage })
   }
 
@@ -87,11 +97,15 @@ export function createProgressController(
       const owner = Symbol("retitle-progress-run")
       // Unattended runs retain stage logging without opening or clearing dialogs.
       const silent = options?.silent === true
+      const sessionID = options?.sessionID
       return {
         show(message, stage): ProgressHandle {
-          const entry: Entry = { owner, token: Symbol("retitle-progress"), stage, silent }
-          current = entry
-          if (!silent) contain(() => surface?.set(message), logger, "progress-show-error")
+          const entry: Entry = { owner, token: Symbol("retitle-progress"), stage, silent, sessionID }
+          entriesByOwner.set(owner, entry)
+          if (!silent) {
+            surfaceOwner = owner
+            contain(() => surface?.set(message), logger, "progress-show-error")
+          }
           logger?.event("progress-shown", { stage })
           return {
             clear() {
@@ -100,13 +114,14 @@ export function createProgressController(
           }
         },
         release() {
-          if (current === undefined || current.owner !== owner) return
+          const current = entriesByOwner.get(owner)
+          if (current === undefined) return
           dismiss(current)
         },
       }
     },
     get active() {
-      return current !== undefined
+      return entriesByOwner.size > 0
     },
   }
 }
