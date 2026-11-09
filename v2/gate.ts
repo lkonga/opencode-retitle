@@ -14,11 +14,11 @@ export type GateDenial = { readonly ok: false; readonly reason: GateRejection }
 export type GateResult = GateGrant | GateDenial
 
 export interface RunGate {
-  begin(): GateResult
+  begin(sessionID?: string, options?: { readonly interactive?: boolean }): GateResult
   /** Releases the slot. A token that is not current is ignored. */
   end(token: symbol): void
   /** True while a run holds the slot. */
-  running(): boolean
+  running(sessionID?: string): boolean
 }
 
 export interface GateOptions {
@@ -38,24 +38,55 @@ export const DEFAULT_DEBOUNCE_MS = 400
 export function createRunGate(options: GateOptions = {}): RunGate {
   const debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
   const now = options.now ?? (() => Date.now())
-  let current: symbol | undefined
-  let lastBeginAt = Number.NEGATIVE_INFINITY
+  const currentBySession = new Map<string, symbol>()
+  const sessionByToken = new Map<symbol, string>()
+  const lastBeginAtBySession = new Map<string, number>()
+  let lastBeginAtGlobal = Number.NEGATIVE_INFINITY
+  let activeInteractiveToken: symbol | undefined
 
   return {
-    begin() {
-      if (current !== undefined) return { ok: false, reason: "in-flight" }
-      if (now() - lastBeginAt < debounceMs) return { ok: false, reason: "debounced" }
+    begin(sessionID?: string, runOptions?: { readonly interactive?: boolean }) {
+      const key = sessionID ?? ""
+      const isInteractive = runOptions?.interactive === true
+
+      if (sessionID !== undefined) {
+        if (currentBySession.has(key)) return { ok: false, reason: "in-flight" }
+        const lastBeginAt = lastBeginAtBySession.get(key) ?? Number.NEGATIVE_INFINITY
+        if (now() - lastBeginAt < debounceMs) return { ok: false, reason: "debounced" }
+      } else {
+        if (currentBySession.size > 0) return { ok: false, reason: "in-flight" }
+        if (now() - lastBeginAtGlobal < debounceMs) return { ok: false, reason: "debounced" }
+      }
+
+      if (isInteractive && activeInteractiveToken !== undefined) {
+        return { ok: false, reason: "in-flight" }
+      }
+
       const token = Symbol("retitle-run")
-      current = token
-      lastBeginAt = now()
+      currentBySession.set(key, token)
+      sessionByToken.set(token, key)
+      lastBeginAtBySession.set(key, now())
+      lastBeginAtGlobal = now()
+      if (isInteractive) {
+        activeInteractiveToken = token
+      }
       return { ok: true, token }
     },
     end(token) {
-      if (current !== token) return
-      current = undefined
+      const key = sessionByToken.get(token)
+      if (key === undefined) return
+      if (currentBySession.get(key) !== token) return
+      currentBySession.delete(key)
+      sessionByToken.delete(token)
+      if (activeInteractiveToken === token) {
+        activeInteractiveToken = undefined
+      }
     },
-    running() {
-      return current !== undefined
+    running(sessionID?: string) {
+      if (sessionID !== undefined) {
+        return currentBySession.has(sessionID)
+      }
+      return currentBySession.size > 0
     },
   }
 }

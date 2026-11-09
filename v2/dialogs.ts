@@ -114,13 +114,13 @@ export async function openRetitle(
     return
   }
 
-  const grant = claimRun(context, adapter)
+  const grant = claimRun(context, adapter, sessionID, { interactive: true })
   if (!grant) return
 
   // Only a granted run owns a progress lane, so a denied duplicate invocation
   // (which returns above) can never clear the active run's progress. The lane is
   // released in `finally`, alongside the gate.
-  const run = adapter.progress.run()
+  const run = adapter.progress.run({ sessionID })
   try {
     const settings = settingsFromArgs(adapter.settings.read(), rawArgs)
     await settingsDialog(context, adapter, sessionID, settings, run)
@@ -151,13 +151,13 @@ export async function openRetitleAuto(
     return
   }
 
-  const grant = claimRun(context, adapter)
+  const grant = claimRun(context, adapter, sessionID, { interactive: false })
   if (!grant) return
 
   // `silent` keeps the run's lane and its progress logs but suppresses surface
   // set/clear: in production the surface is `dialog.show`, which this path must
   // never touch.
-  const run = adapter.progress.run({ silent: true })
+  const run = adapter.progress.run({ silent: true, sessionID })
   // Inventory observers must not interrupt the run or its cleanup.
   const notifyPending = (delta: 1 | -1) => {
     try {
@@ -188,7 +188,7 @@ export async function openRetitleAuto(
     // `executeRetitle` reports its own failures, so a throw here is unexpected.
     // It must still leave the toast as the only trace and release the lane.
     adapter.logger.event("auto-error", { sessionID, error })
-    toast(context, adapter, "auto-error", "error", "Retitle (auto) failed unexpectedly")
+    toast(context, adapter, `auto-error:${sessionID}`, "error", "Retitle (auto) failed unexpectedly")
   } finally {
     try {
       run.release()
@@ -207,11 +207,16 @@ export async function openRetitleAuto(
  * auto runs go through the same helper, so each rejects the other with the same
  * log event and the same toast.
  */
-function claimRun(context: RetitleUiContext, adapter: RetitleAdapter): GateGrant | undefined {
-  const grant = adapter.gate.begin()
+function claimRun(
+  context: RetitleUiContext,
+  adapter: RetitleAdapter,
+  sessionID: string,
+  options?: { readonly interactive?: boolean },
+): GateGrant | undefined {
+  const grant = adapter.gate.begin(sessionID, options)
   if (grant.ok) return grant
-  adapter.logger.event("rejected", { reason: grant.reason })
-  if (grant.reason === "in-flight") toast(context, adapter, "in-flight", "warning", IN_FLIGHT_MESSAGE)
+  adapter.logger.event("rejected", { sessionID, reason: grant.reason })
+  if (grant.reason === "in-flight") toast(context, adapter, `in-flight:${sessionID}`, "warning", IN_FLIGHT_MESSAGE)
   return undefined
 }
 
@@ -340,7 +345,13 @@ async function handleOutcome(
   }
   if (outcome.status === "empty") {
     adapter.logger.event("outcome-empty", { sessionID, messageCount: outcome.messageCount })
-    toast(context, adapter, "empty", "warning", "Nothing to retitle yet: this session has no user turns to sample")
+    toast(
+      context,
+      adapter,
+      `empty:${sessionID}`,
+      "warning",
+      "Nothing to retitle yet: this session has no user turns to sample",
+    )
     return "done"
   }
   if (outcome.status === "no-title") {
@@ -349,14 +360,14 @@ async function handleOutcome(
     toast(
       context,
       adapter,
-      `no-title:${label}`,
+      `no-title:${sessionID}:${label}`,
       "warning",
       `No title came back from ${label}. Pick another model in settings.`,
     )
     return "reopen"
   }
   adapter.logger.event("outcome-error", { sessionID, code: outcome.code })
-  toast(context, adapter, `error:${outcome.code}`, "error", outcome.message)
+  toast(context, adapter, `error:${sessionID}:${outcome.code}`, "error", outcome.message)
   return "reopen"
 }
 
@@ -457,11 +468,11 @@ export async function applyConfirmedTitle(
     applyRetitleTitle(adapter.ports, sessionID, title, adapter.logger),
   )
   if (!result.ok) {
-    toast(context, adapter, `apply-error:${result.code}`, "error", "Failed to update session title")
+    toast(context, adapter, `apply-error:${sessionID}:${result.code}`, "error", "Failed to update session title")
     return false
   }
   adapter.logger.event("applied", { sessionID, model: modelLabel, titleLength: title.length })
-  toast(context, adapter, "applied", "success", `New title: ${title}`)
+  toast(context, adapter, `applied:${sessionID}`, "success", `New title: ${title}`)
   return true
 }
 

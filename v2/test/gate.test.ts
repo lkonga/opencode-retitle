@@ -58,6 +58,70 @@ describe("createRunGate", () => {
     if (!second.ok) throw new Error("unreachable")
     expect(gate.running()).toBe(true)
   })
+
+  test("allows distinct sessions to run concurrently and isolates release and debounce per session", () => {
+    let now = 1_000
+    const gate = createRunGate({ now: () => now, debounceMs: 400 })
+    const run1 = gate.begin("ses_1")
+    expect(run1.ok).toBe(true)
+    expect(gate.running("ses_1")).toBe(true)
+    expect(gate.running("ses_2")).toBe(false)
+    expect(gate.running()).toBe(true)
+
+    // Second distinct session can run concurrently
+    const run2 = gate.begin("ses_2")
+    expect(run2.ok).toBe(true)
+    expect(gate.running("ses_2")).toBe(true)
+    expect(gate.running()).toBe(true)
+
+    // Same session duplicate is rejected as in-flight
+    expect(gate.begin("ses_1")).toEqual({ ok: false, reason: "in-flight" })
+    expect(gate.begin("ses_2")).toEqual({ ok: false, reason: "in-flight" })
+
+    // Ending ses_1 releases only ses_1
+    if (run1.ok) gate.end(run1.token)
+    expect(gate.running("ses_1")).toBe(false)
+    expect(gate.running("ses_2")).toBe(true)
+    expect(gate.running()).toBe(true)
+
+    // Immediate re-run for ses_1 is debounced, while an unrun session is not
+    expect(gate.begin("ses_1")).toEqual({ ok: false, reason: "debounced" })
+    const run3 = gate.begin("ses_3")
+    expect(run3.ok).toBe(true)
+    if (run3.ok) gate.end(run3.token)
+
+    // Ending ses_2 releases ses_2
+    if (run2.ok) gate.end(run2.token)
+    expect(gate.running("ses_2")).toBe(false)
+    expect(gate.running()).toBe(false)
+
+    // After debounce window passes, ses_1 can run again
+    now += 500
+    expect(gate.begin("ses_1").ok).toBe(true)
+  })
+
+  test("prevents concurrent interactive claims across different sessions to protect modal surface", () => {
+    const gate = createRunGate({ debounceMs: 0 })
+    const interactive1 = gate.begin("ses_1", { interactive: true })
+    expect(interactive1.ok).toBe(true)
+
+    // Second interactive claim for a different session is rejected (modal collision protection)
+    const interactive2 = gate.begin("ses_2", { interactive: true })
+    expect(interactive2).toEqual({ ok: false, reason: "in-flight" })
+
+    // Auto claim for different session is allowed (preserves auto concurrency)
+    const auto2 = gate.begin("ses_2", { interactive: false })
+    expect(auto2.ok).toBe(true)
+
+    // Auto claim for third session is also allowed concurrently
+    const auto3 = gate.begin("ses_3")
+    expect(auto3.ok).toBe(true)
+
+    // Releasing interactive1 allows new interactive claim
+    if (interactive1.ok) gate.end(interactive1.token)
+    const interactive3 = gate.begin("ses_4", { interactive: true })
+    expect(interactive3.ok).toBe(true)
+  })
 })
 
 describe("createDebouncer", () => {

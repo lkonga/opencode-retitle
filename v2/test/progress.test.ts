@@ -150,6 +150,27 @@ describe("createProgressController", () => {
       { name: "progress-cleared", fields: { stage: "applying" } },
     ])
   })
+
+  test("isolates progress lanes per session without cross-lane release", () => {
+    const progress = fakeProgress()
+    const log = captureLogger()
+    const controller = createProgressController(progress.surface, log.logger)
+    const run1 = controller.run({ sessionID: "ses_1", silent: true })
+    const run2 = controller.run({ sessionID: "ses_2", silent: true })
+
+    run1.show(PROGRESS_GENERATING, "generating")
+    run2.show(PROGRESS_GENERATING, "generating")
+
+    expect(controller.active).toBe(true)
+
+    // Releasing run1 does not release run2
+    run1.release()
+    expect(controller.active).toBe(true)
+
+    // Releasing run2 releases everything
+    run2.release()
+    expect(controller.active).toBe(false)
+  })
 })
 
 describe("withProgress", () => {

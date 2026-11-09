@@ -8,7 +8,7 @@ import type { SessionApiClient } from "../session-api"
 import type { SettingsStorage } from "../settings"
 import type { RetitleContext } from "../adapter"
 import type { ProgressSurface } from "../progress"
-import type { DialogApi, RetitleUiContext, SelectOption, ToastApi, ToastVariant } from "../dialogs"
+import type { DialogApi, RetitleUiContext, RouteLike, SelectOption, ToastApi, ToastVariant } from "../dialogs"
 
 export type Recorded = {
   readonly creates: Array<Record<string, unknown>>
@@ -269,17 +269,24 @@ export type FakeUi = RetitleUiContext & {
   readonly toasts: Array<{ variant?: ToastVariant; message: string }>
   readonly selects: Array<{ title: string; options: ReadonlyArray<SelectOption<unknown>> }>
   readonly prompts: Array<string | undefined>
+  setRoute(route: RouteLike): void
 }
 
 /** A dialog that answers each call from a queue; `undefined` cancels. */
 export function fakeUi(answers: {
   readonly select?: Array<string | boolean | undefined>
   readonly prompt?: Array<string | undefined>
+  readonly sessionID?: string
+  readonly route?: RouteLike
 }): FakeUi {
   const toasts: FakeUi["toasts"] = []
   const selects: FakeUi["selects"] = []
   const selectQueue = [...(answers.select ?? [])]
   const promptQueue = [...(answers.prompt ?? [])]
+  let currentRoute: RouteLike = answers.route ?? {
+    type: "session",
+    sessionID: answers.sessionID ?? "ses_current",
+  }
 
   const dialog: DialogApi = {
     select<Value>(options: {
@@ -305,22 +312,19 @@ export function fakeUi(answers: {
     ui: {
       dialog,
       toast,
-      router: { current: () => ({ type: "session", sessionID: "ses_current" }) },
+      router: { current: () => currentRoute },
     },
     toasts,
     selects,
     prompts: promptQueue,
+    setRoute(route: RouteLike) {
+      currentRoute = route
+    },
   } as FakeUi
 }
 
 export function fakeUiAtHome(): FakeUi {
-  const base = fakeUi({})
-  return {
-    ui: { ...base.ui, router: { current: () => ({ type: "home" as const }) } },
-    toasts: base.toasts,
-    selects: base.selects,
-    prompts: base.prompts,
-  } as unknown as FakeUi
+  return fakeUi({ route: { type: "home" } })
 }
 
 /** A promise that never settles, for deadline tests. */
