@@ -34,6 +34,12 @@ the current session's title from a bounded sample of its conversation, on demand
 
 ## Behaviour
 
+`/retitle-auto-sessions` snapshots open tab IDs once. Cold metadata is recovered
+only by exact-ID sync or fetch; sessions whose root status cannot be verified are
+skipped and reported. Sessions using the reserved `title` agent are conservatively
+excluded even if deliberately created as roots; a matching display title alone
+does not exclude a normal session.
+
 1. Resolve the current session from `context.ui.router.current()`; refuse with a
    toast when no session route is active.
 2. Claim the run gate. A second `/retitle` while one is running is rejected
