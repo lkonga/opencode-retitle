@@ -1,4 +1,4 @@
-// The /retitle and /retitle-auto command registrations.
+// The /retitle, /retitle-auto, and /retitle-auto-sessions command registrations.
 //
 // "Exactly once, in both the slash menu and the palette" is a structural
 // property here, not a convention: one command object carries both `palette`
@@ -35,8 +35,12 @@ export const RETITLE_COMMAND_ID = "retitle.session.retitle"
 export const RETITLE_SLASH_NAME = "retitle"
 export const RETITLE_AUTO_COMMAND_ID = "retitle.session.retitle_auto"
 export const RETITLE_AUTO_SLASH_NAME = "retitle-auto"
+export const RETITLE_AUTO_SESSIONS_COMMAND_ID = "retitle.session.retitle_auto_sessions"
+export const RETITLE_AUTO_SESSIONS_SLASH_NAME = "retitle-auto-sessions"
 /** Fixed, non-remappable key stroke for the command (see the header). */
 export const RETITLE_BIND = "ctrl+shift+r"
+
+export type RetitleCommandKind = "interactive" | "auto" | "batch"
 
 export interface RetitleKeymapCommand {
   readonly id: string
@@ -58,31 +62,66 @@ export function createRetitleCommand(
   handler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
 ): RetitleKeymapCommand {
-  return createCommand(false, handler, onError)
+  return createCommand("interactive", handler, onError)
 }
 
 export function createRetitleAutoCommand(
   handler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
 ): RetitleKeymapCommand {
-  return createCommand(true, handler, onError)
+  return createCommand("auto", handler, onError)
 }
 
-function createCommand(
-  auto: boolean,
+export function createRetitleAutoSessionsCommand(
   handler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
 ): RetitleKeymapCommand {
+  return createCommand("batch", handler, onError)
+}
+
+function createCommand(
+  kind: RetitleCommandKind,
+  handler: (rawArgs: string) => void | Promise<void>,
+  onError?: (error: unknown) => void,
+): RetitleKeymapCommand {
+  let id: string
+  let title: string
+  let description: string
+  let slashName: string
+  let bind: string | undefined
+
+  switch (kind) {
+    case "interactive":
+      id = RETITLE_COMMAND_ID
+      title = "Retitle Session (Recent)"
+      description = "Retitle the session from sampled recent turns. Args: [hint], --samples N, --from P%, --offset N"
+      slashName = RETITLE_SLASH_NAME
+      bind = RETITLE_BIND
+      break
+    case "auto":
+      id = RETITLE_AUTO_COMMAND_ID
+      title = "Retitle Session (Auto)"
+      description =
+        "Generate and apply a title with current settings, without dialogs. Args: [hint], --samples N, --from P%, --offset N"
+      slashName = RETITLE_AUTO_SLASH_NAME
+      break
+    case "batch":
+      id = RETITLE_AUTO_SESSIONS_COMMAND_ID
+      title = "Retitle All Open Sessions (Auto)"
+      description =
+        "Generate and apply titles for all open session tabs in parallel without dialogs. Args: [hint], --samples N, --from P%, --offset N"
+      slashName = RETITLE_AUTO_SESSIONS_SLASH_NAME
+      break
+  }
+
   return {
-    id: auto ? RETITLE_AUTO_COMMAND_ID : RETITLE_COMMAND_ID,
-    title: auto ? "Retitle Session (Auto)" : "Retitle Session (Recent)",
-    description: auto
-      ? "Generate and apply a title with current settings, without dialogs. Args: [hint], --samples N, --from P%, --offset N"
-      : "Retitle the session from sampled recent turns. Args: [hint], --samples N, --from P%, --offset N",
+    id,
+    title,
+    description,
     group: "Session",
-    ...(!auto ? { bind: RETITLE_BIND } : {}),
+    ...(bind ? { bind } : {}),
     palette: true,
-    slash: { name: auto ? RETITLE_AUTO_SLASH_NAME : RETITLE_SLASH_NAME, arguments: true },
+    slash: { name: slashName, arguments: true },
     run: (input) => {
       // The handler owns its own error surface (it toasts); anything escaping it
       // is a bug that must not become an unhandled rejection in the keymap.
@@ -93,11 +132,26 @@ function createCommand(
   }
 }
 
-/** The plugin's complete keymap contribution: one global layer, both commands. */
+/**
+ * Keymap contribution factory:
+ * - 2 args: `(handler, autoHandler)` -> 2 commands
+ * - 3 args: `(handler, autoHandler, onError)` -> 2 commands (preserves legacy signature position)
+ * - 4 args: `(handler, autoHandler, onError, batchHandler)` -> 3 commands
+ */
 export function retitleKeymapLayer(
   handler: (rawArgs: string) => void | Promise<void>,
   autoHandler: (rawArgs: string) => void | Promise<void>,
   onError?: (error: unknown) => void,
+  batchHandler?: (rawArgs: string) => void | Promise<void>,
 ): RetitleKeymapLayer {
-  return { mode: "global", commands: [createRetitleCommand(handler, onError), createRetitleAutoCommand(autoHandler, onError)] }
+  const commands: RetitleKeymapCommand[] = [
+    createRetitleCommand(handler, onError),
+    createRetitleAutoCommand(autoHandler, onError),
+  ]
+
+  if (batchHandler) {
+    commands.push(createRetitleAutoSessionsCommand(batchHandler, onError))
+  }
+
+  return { mode: "global", commands }
 }

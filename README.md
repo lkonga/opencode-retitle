@@ -4,7 +4,7 @@ TUI plugin for [OpenCode](https://opencode.ai) that adds a `/retitle` slash comm
 
 > **OpenCode V2 (OC2) Support:**  
 > OpenCode V2 is supported on the **`v2-production`** branch (located in the `./v2` subdirectory).  
-> It provides both interactive `/retitle` (`ctrl+shift+r`) and unattended `/retitle-auto` (with no pop-up dialogs and a `/btw`-style footer spinner). See [`v2/README.md`](./v2/README.md) for full V2 details and installation in `cli.json`.
+> It provides interactive `/retitle` (`ctrl+shift+r`), unattended `/retitle-auto` (with no pop-up dialogs and a `/btw`-style footer spinner), and batch `/retitle-auto-sessions` for all open tabs in parallel. See [`v2/README.md`](./v2/README.md) for full V2 details and installation in `cli.json`.
 
 ## How it works
 

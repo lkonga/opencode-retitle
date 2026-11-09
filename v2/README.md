@@ -15,8 +15,10 @@ the current session's title from a bounded sample of its conversation, on demand
 | File | Purpose |
 |---|---|
 | `tui.tsx` | V2 TUI entrypoint. App slot claim, keymap layer, and animated footer spinner status. |
-| `command.ts` | The `/retitle` and `/retitle-auto` commands (palette + slash + the fixed `ctrl+shift+r` binding for interactive) and the `mode: "global"` layer factory. |
-| `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply, plus `openRetitleAuto` for unattended execution. |
+| `command.ts` | The `/retitle`, `/retitle-auto`, and `/retitle-auto-sessions` commands (palette + slash + the fixed `ctrl+shift+r` binding for interactive) and the `mode: "global"` layer factory. |
+| `dialogs.ts` | Lifecycle: run gate → settings dialog → run → confirm (Apply/Edit/Regenerate/Cancel) → apply, plus `openRetitleAuto` and `executeRetitleAutoWithGrant` for unattended execution. |
+| `batch.ts` | Batch auto lifecycle (`/retitle-auto-sessions`): snapshots root session tabs, filters helper sessions, bounds concurrency (default 2), reserves run gate per session, tolerates partial failures, and summarizes progress. |
+| `batch-scope.ts` | Pure tab snapshotting (`ui.tabs.list`) and defensive child/helper session filtering (`root`, `parentID`, `TITLE_AGENT` + `HELPER_TITLE`). |
 | `runner.ts` | Pure pipeline over injected ports: sample → model → native generation → clean title. |
 | `progress.ts` | Run-scoped generation/apply progress: token-safe set/clear lifecycle over a public `{ set(message), clear() }` surface. |
 | `adapter.ts` | The only module that knows `Plugin.Context`; wires context → ports, settings, gate, logger. |
@@ -31,6 +33,12 @@ the current session's title from a bounded sample of its conversation, on demand
 | `test/*.test.ts` | Behavioural tests (`bun test`), no TUI runtime required. |
 
 ## Behaviour
+
+`/retitle-auto-sessions` snapshots open tab IDs once. Cold metadata is recovered
+only by exact-ID sync or fetch; sessions whose root status cannot be verified are
+skipped and reported. Sessions using the reserved `title` agent are conservatively
+excluded even if deliberately created as roots; a matching display title alone
+does not exclude a normal session.
 
 1. Resolve the current session from `context.ui.router.current()`; refuse with a
    toast when no session route is active.
@@ -69,6 +77,8 @@ dialog options can also be seeded from the command line:
 /retitle --offset 30 --samples 15 docker    # last 30 messages, 15 samples, hint
 /retitle-auto                               # unattended: uses current settings & auto-applies title without dialogs
 /retitle-auto quick fix                     # unattended with steering hint
+/retitle-auto-sessions                      # batch: retitles all open root session tabs in parallel (concurrency 2)
+/retitle-auto-sessions --samples 15 cleanup # batch with flags and steering hint
 ```
 
 | Flag | Default | Range | Meaning |
@@ -81,6 +91,16 @@ Remaining text after the flags is the steering hint. The ranges are clamped, not
 rejected: `--samples` is clamped to `3..50`, `--from` to `0..100` and `--offset`
 to `>=1`. (`--offset 0` is therefore out of range and becomes `1`; the dialog's
 `Offset: 0` entry means "all messages" and simply omits the flag.)
+
+### Batch Auto Retitling (`/retitle-auto-sessions`)
+
+`/retitle-auto-sessions` runs unattended title generation across all open tabs in parallel:
+* **Scope**: Synchronously snapshots open tabs from `ui.tabs.list` once at invocation. It never queries the backend or project session list (`data.session.list` / `client.session.list`), so unopened sessions are never touched.
+* **Filtering**: Defensively deduplicates tabs, excludes child sessions (`root(id) !== id` or presence of `parentID`), and excludes known helper sessions (`agent === TITLE_AGENT && title === HELPER_TITLE`).
+* **Settings & Execution**: Reads durable settings and command-line arguments once at start. Runs with bounded concurrency (default 2 workers). Captured session IDs survive tab closures, new tabs, and active tab navigation.
+* **Reservation & Exclusion**: Synchronously reserves the shared run gate for all captured IDs before any asynchronous tick. Queued sessions are protected from singleton `/retitle-auto` or interactive `/retitle` in both directions. Sessions that are already running or inside their debounce window are cleanly skipped, as are empty sessions. Provider errors, no-title responses, and title write errors are recorded as failed without stopping other sessions.
+* **Status & Feedback**: Progress is reported non-blockingly in the prompt footer status spinner (`retitle-auto-sessions: C/T (U updated, S skipped, F failed)`). Upon completion, exactly one summary toast is presented.
+* **No Cancellation**: There is no cancellation command; closing a tab does not cancel an in-flight batch pass. There is no background timer or continuous polling daemon. Duplicate batch invocations while one is active return immediately without enqueuing duplicate work or resetting progress.
 
 ### Keybind
 
@@ -260,6 +280,14 @@ Coverage highlights:
   Regenerate, empty session, provider failure reopening settings, model
   persistence, gate release on a throwing dialog, generation/apply progress shown
   and cleared on every outcome, and the post-write session refresh.
+* `batch-flow.test.ts` — batch auto retitling (`/retitle-auto-sessions`):
+  synchronous snapshot of `ui.tabs.list`, deduplication, filtering of child sessions
+  (`root(id) !== id` and `parentID`) and known plugin helpers (`TITLE_AGENT` + `HELPER_TITLE`),
+  bounded worker concurrency (2), synchronous gate pre-claiming across all captured IDs
+  preventing queued tabs from being stolen by singleton auto or interactive runs,
+  immediate suppression of duplicate batch runs without resetting progress,
+  graceful handling of partial failures (empty sessions, no-title, provider error, apply error),
+  and clean gate token release on all exit paths.
 * `adapter.test.ts` — durable settings round trip, store fallback with bounded
   slice, catalogue degradation, the full model chain (a stale `title` agent model
   skipped to the session, assistant and catalogue steps; the strict override

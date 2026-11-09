@@ -93,8 +93,28 @@ export interface RetitleUiContext {
     readonly dialog: DialogApi
     readonly toast: ToastApi
     readonly router: { current(): RouteLike }
+    readonly tabs?: {
+      enabled(): boolean
+      list(): readonly {
+        readonly sessionID: string
+        readonly title?: string
+        readonly active: boolean
+        readonly busy: boolean
+        readonly attention: boolean
+        readonly unread?: "activity" | "error"
+      }[]
+      open(sessionID: string): boolean
+      focus(sessionID: string): boolean
+      move(sessionID: string, index: number): boolean
+      close(sessionID?: string): boolean
+    }
   }
 }
+
+export type RetitleAutoResult =
+  | { readonly status: "updated"; readonly title: string }
+  | { readonly status: "skipped"; readonly reason: "empty" | "debounced" | "in-flight" }
+  | { readonly status: "failed"; readonly error?: unknown }
 
 const NO_SESSION_MESSAGE = "Open a session before using /retitle"
 const AUTO_NO_SESSION_MESSAGE = "Open a session before using /retitle-auto"
@@ -154,49 +174,84 @@ export async function openRetitleAuto(
   const grant = claimRun(context, adapter, sessionID, { interactive: false })
   if (!grant) return
 
-  // `silent` keeps the run's lane and its progress logs but suppresses surface
-  // set/clear: in production the surface is `dialog.show`, which this path must
-  // never touch.
-  const run = adapter.progress.run({ silent: true, sessionID })
-  // Inventory observers must not interrupt the run or its cleanup.
+  await executeRetitleAutoWithGrant(context, adapter, sessionID, rawArgs, grant, {
+    notify: true,
+    onPendingChange,
+  })
+}
+
+/**
+ * Low-level auto execution with an already-claimed GateGrant.
+ * Reusable by singleton auto and batch auto.
+ * Releases the grant and progress run in finally.
+ */
+export async function executeRetitleAutoWithGrant(
+  context: RetitleUiContext,
+  adapter: RetitleAdapter,
+  sessionID: string,
+  settingsOrRawArgs: RetitleSettings | string,
+  grant: GateGrant,
+  options?: {
+    readonly notify?: boolean
+    readonly onPendingChange?: (delta: 1 | -1) => void
+  },
+): Promise<RetitleAutoResult> {
+  const notify = options?.notify ?? false
+  let run: ProgressRun | undefined
+  let pendingReported = false
+
   const notifyPending = (delta: 1 | -1) => {
     try {
-      onPendingChange?.(delta)
+      options?.onPendingChange?.(delta)
     } catch {
       // A status observer is best-effort, not part of the retitle operation.
     }
   }
+
   try {
+    run = adapter.progress.run({ silent: true, sessionID })
     notifyPending(1)
-    const settings = settingsFromArgs(adapter.settings.read(), rawArgs)
+    pendingReported = true
+
+    const settings =
+      typeof settingsOrRawArgs === "string"
+        ? settingsFromArgs(adapter.settings.read(), settingsOrRawArgs)
+        : settingsOrRawArgs
     const outcome = await withProgress(run, PROGRESS_GENERATING, "generating", () =>
       executeRetitle(adapter.ports, { sessionID, settings, logger: adapter.logger }),
     )
 
     if (outcome.status !== "ok") {
-      // Failure surface only: `handleOutcome` never opens a dialog for a non-ok
-      // outcome (it logs and toasts), and its "reopen" answer is meaningless
-      // here because there is no settings loop to return to.
-      await handleOutcome(context, adapter, sessionID, outcome, run)
-      return
+      await handleOutcome(context, adapter, sessionID, outcome, run, notify)
+      if (outcome.status === "empty") {
+        return { status: "skipped", reason: "empty" }
+      }
+      return { status: "failed", error: outcome }
     }
 
     const label = `${outcome.model.providerID}/${outcome.model.modelID}`
     adapter.logger.event("auto-apply", { sessionID, model: label })
-    await applyConfirmedTitle(context, adapter, sessionID, outcome.title, label, run)
+    const applied = await applyConfirmedTitle(context, adapter, sessionID, outcome.title, label, run, notify)
+    if (applied) {
+      return { status: "updated", title: outcome.title }
+    }
+    return { status: "failed" }
   } catch (error) {
-    // `executeRetitle` reports its own failures, so a throw here is unexpected.
-    // It must still leave the toast as the only trace and release the lane.
     adapter.logger.event("auto-error", { sessionID, error })
-    toast(context, adapter, `auto-error:${sessionID}`, "error", "Retitle (auto) failed unexpectedly")
+    if (notify) {
+      toast(context, adapter, `auto-error:${sessionID}`, "error", "Retitle (auto) failed unexpectedly")
+    }
+    return { status: "failed", error }
   } finally {
     try {
-      run.release()
+      run?.release()
     } finally {
       try {
         adapter.gate.end(grant.token)
       } finally {
-        notifyPending(-1)
+        if (pendingReported) {
+          notifyPending(-1)
+        }
       }
     }
   }
@@ -338,6 +393,7 @@ async function handleOutcome(
   sessionID: string,
   outcome: RetitleOutcome,
   run: ProgressRun,
+  notify = true,
 ): Promise<"done" | "reopen"> {
   if (outcome.status === "ok") {
     const label = `${outcome.model.providerID}/${outcome.model.modelID}`
@@ -345,29 +401,35 @@ async function handleOutcome(
   }
   if (outcome.status === "empty") {
     adapter.logger.event("outcome-empty", { sessionID, messageCount: outcome.messageCount })
-    toast(
-      context,
-      adapter,
-      `empty:${sessionID}`,
-      "warning",
-      "Nothing to retitle yet: this session has no user turns to sample",
-    )
+    if (notify) {
+      toast(
+        context,
+        adapter,
+        `empty:${sessionID}`,
+        "warning",
+        "Nothing to retitle yet: this session has no user turns to sample",
+      )
+    }
     return "done"
   }
   if (outcome.status === "no-title") {
     const label = outcome.model.providerID + "/" + outcome.model.modelID
     adapter.logger.event("outcome-no-title", { sessionID, providerID: outcome.model.providerID })
-    toast(
-      context,
-      adapter,
-      `no-title:${sessionID}:${label}`,
-      "warning",
-      `No title came back from ${label}. Pick another model in settings.`,
-    )
+    if (notify) {
+      toast(
+        context,
+        adapter,
+        `no-title:${sessionID}:${label}`,
+        "warning",
+        `No title came back from ${label}. Pick another model in settings.`,
+      )
+    }
     return "reopen"
   }
   adapter.logger.event("outcome-error", { sessionID, code: outcome.code })
-  toast(context, adapter, `error:${sessionID}:${outcome.code}`, "error", outcome.message)
+  if (notify) {
+    toast(context, adapter, `error:${sessionID}:${outcome.code}`, "error", outcome.message)
+  }
   return "reopen"
 }
 
@@ -461,6 +523,7 @@ export async function applyConfirmedTitle(
   title: string,
   modelLabel: string,
   run: ProgressRun,
+  notify = true,
 ): Promise<boolean> {
   // The write reports its own progress; the port resolves only after the
   // reactive refresh, so the success toast below always follows write+refresh.
@@ -468,11 +531,15 @@ export async function applyConfirmedTitle(
     applyRetitleTitle(adapter.ports, sessionID, title, adapter.logger),
   )
   if (!result.ok) {
-    toast(context, adapter, `apply-error:${sessionID}:${result.code}`, "error", "Failed to update session title")
+    if (notify) {
+      toast(context, adapter, `apply-error:${sessionID}:${result.code}`, "error", "Failed to update session title")
+    }
     return false
   }
   adapter.logger.event("applied", { sessionID, model: modelLabel, titleLength: title.length })
-  toast(context, adapter, `applied:${sessionID}`, "success", `New title: ${title}`)
+  if (notify) {
+    toast(context, adapter, `applied:${sessionID}`, "success", `New title: ${title}`)
+  }
   return true
 }
 
@@ -523,7 +590,7 @@ async function numberPicker(
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function toast(
+export function toast(
   context: RetitleUiContext,
   adapter: RetitleAdapter,
   key: string,
