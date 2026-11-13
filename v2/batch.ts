@@ -70,6 +70,13 @@ export class BatchController {
 
     const candidateIDs = scope.candidateIDs
     const total = candidateIDs.length
+    const started = Date.now()
+    const batchID = `${started.toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+    safeEvent(this.adapter, "batch-start", { batchID, total })
+    const finish = (summary: BatchSummary): BatchSummary => {
+      safeEvent(this.adapter, "batch-end", { batchID, ...summary, durationMs: Date.now() - started })
+      return summary
+    }
     const claimedGrants = new Map<string, GateGrant>()
     let preclaimSkippedCount = 0
     let pendingReported = false
@@ -94,7 +101,7 @@ export class BatchController {
           claimedGrants.set(sessionID, grant)
         } else {
           preclaimSkippedCount++
-          safeEvent(this.adapter, "batch-session-skipped", { sessionID, reason: grant.reason })
+          safeEvent(this.adapter, "batch-session-skipped", { batchID, sessionID, reason: grant.reason })
         }
       }
 
@@ -112,7 +119,7 @@ export class BatchController {
           "warning",
           `Batch retitle: 0 updated, ${preclaimSkippedCount} skipped, 0 failed (${total} total)`,
         )
-        return summary
+        return finish(summary)
       }
 
       notifyPending(1)
@@ -167,7 +174,7 @@ export class BatchController {
             skipped++
             completed++
             if (verification.reason === "unverified") unverified++
-            safeEvent(this.adapter, "batch-session-skipped", { sessionID: id, reason: verification.reason })
+            safeEvent(this.adapter, "batch-session-skipped", { batchID, sessionID: id, reason: verification.reason })
             emitProgress()
           }
         }
@@ -193,7 +200,7 @@ export class BatchController {
         "warning",
         `Batch retitle: 0 updated, ${skipped} skipped, 0 failed (${total} total)${unverified ? `; ${unverified} unverified metadata` : ""}`,
       )
-      return summary
+      return finish(summary)
     }
 
       const requestedConcurrency = options?.concurrency
@@ -221,6 +228,7 @@ export class BatchController {
               workerSettings,
               grant,
             )
+            safeEvent(this.adapter, "batch-session-result", { batchID, sessionID, status: result.status })
 
             if (result.status === "updated") {
               updated++
@@ -232,7 +240,7 @@ export class BatchController {
           } catch (error) {
             failed++
             try {
-              this.adapter.logger.event("batch-worker-error", { sessionID, error })
+              this.adapter.logger.event("batch-worker-error", { batchID, sessionID, error })
             } catch {
               // Contain logger errors to protect sibling workers
             }
@@ -259,13 +267,16 @@ export class BatchController {
         summaryToast,
       )
 
-      return {
+      return finish({
         status: "completed",
         updated,
         skipped,
         failed,
         total,
-      }
+      })
+    } catch (error) {
+      safeEvent(this.adapter, "batch-end", { batchID, status: "error", total, durationMs: Date.now() - started, error })
+      throw error
     } finally {
       // Release every remaining claimed grant unconditionally on exit path (idempotent)
       for (const grant of claimedGrants.values()) {

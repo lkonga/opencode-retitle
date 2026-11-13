@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { createRetitleAdapter } from "../adapter"
+import { createRetitleLogger } from "../logger"
 import {
   RETITLE_AUTO_SESSIONS_COMMAND_ID,
   RETITLE_AUTO_SESSIONS_SLASH_NAME,
@@ -138,6 +139,37 @@ function setupBatch(options: {
     },
   }
 }
+
+describe("batch diagnostic correlation", () => {
+  test("emits one redacted aggregate end when settings fail", async () => {
+    const { ui, adapter, recorded } = setupBatch({ tabs: [{ sessionID: "ses_1", active: true, busy: false, attention: false }] })
+    const lines: string[] = []
+    const real = createRetitleLogger({ write: (line) => lines.push(line) })
+    const record = adapter.logger.event.bind(adapter.logger)
+    adapter.logger.event = (name, fields) => { record(name, fields); real.event(name, fields) }
+    ;(adapter.settings as any).read = () => { throw new Error("PRIVATE-TRANSCRIPT") }
+    await expect(openRetitleAutoSessions(ui, adapter, "")).rejects.toThrow()
+    const starts = recorded.events.filter((event) => event.name === "batch-start")
+    const ends = recorded.events.filter((event) => event.name === "batch-end")
+    expect(starts).toHaveLength(1)
+    expect(ends).toHaveLength(1)
+    expect(ends[0].fields).toMatchObject({ batchID: starts[0].fields.batchID, status: "error" })
+    expect(lines.join("")).not.toContain("PRIVATE-TRANSCRIPT")
+    expect(lines.filter((line) => JSON.parse(line).event === "batch-end")).toHaveLength(1)
+  })
+  test("emits one aggregate end with matching start and per-session outcome", async () => {
+    const { ui, adapter, recorded } = setupBatch({ tabs: [{ sessionID: "ses_1", active: true, busy: false, attention: false }] })
+    const summary = await openRetitleAutoSessions(ui, adapter, "")
+    const start = recorded.events.filter((event) => event.name === "batch-start")
+    const end = recorded.events.filter((event) => event.name === "batch-end")
+    const result = recorded.events.filter((event) => event.name === "batch-session-result")
+    expect(start).toHaveLength(1)
+    expect(end).toHaveLength(1)
+    expect(result).toHaveLength(1)
+    expect(end[0].fields).toMatchObject({ batchID: start[0].fields.batchID, total: summary.total, updated: summary.updated, skipped: summary.skipped, failed: summary.failed })
+    expect(result[0].fields).toMatchObject({ batchID: start[0].fields.batchID, sessionID: "ses_1" })
+  })
+})
 
 describe("command registration (/retitle-auto-sessions)", () => {
   test("registers three commands when 4 args provided, and legacy 3 args passes onError to first 2", async () => {
