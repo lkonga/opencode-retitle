@@ -303,3 +303,26 @@ Coverage highlights:
   Imports are read with `Bun.Transpiler.scan`, not by matching source text.
 
 Runtime smokes on the V2 binary are recorded on issue #239.
+# Diagnostic logging
+
+By default V2 writes selective, redacted outcomes, failures, and batch start/end
+counts to `/tmp/opencode-retitle.log`; set `OPENCODE_RETITLE_LOG` to override
+the path, or `OPENCODE_RETITLE_LOG_ENABLED=0` to disable logging. Set
+`OPENCODE_RETITLE_DEBUG=1` for additional event names (the same field privacy
+rules still apply). No prompts, titles, message bodies, or error messages are
+recorded. Batch events use a per-run correlation ID and session outcomes.
+
+Rotation defaults to 1 MiB per file plus three backups (at most 4 MiB across
+the active file and backups). `OPENCODE_RETITLE_LOG_MAX_BYTES` and
+`OPENCODE_RETITLE_LOG_BACKUPS` can lower these limits (minimum 1024 bytes,
+maximum three backups). Existing oversized files in the retention set are
+truncated on the next successful write. Files are mode 0600; the parent
+directory must already exist and be suitably protected. Event records are capped.
+On Linux and macOS, writers use a non-waiting OS `flock` on a persistent empty
+`.lockfile` beside the log: contention drops diagnostics, never retitle work.
+The kernel releases the lock on process exit or crash; the lockfile must not
+be removed while writers may be active. Unsupported platforms or unavailable
+native locking disable logging without affecting retitling. Lowering retention
+removes only the managed `.1` through `.3` files outside the new limit on the
+next successful write. Logging is best effort, not a lossless audit trail;
+legacy writers or other programs ignoring the lock are not coordinated.
